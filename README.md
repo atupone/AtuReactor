@@ -15,6 +15,14 @@
 
 ---
 
+## Integration
+If you have installed the library, add this to your `CMakeLists.txt`:
+
+```cmake
+find_package(AtuReactor REQUIRED)
+target_link_libraries(my_project PRIVATE AtuReactor::AtuReactor)
+```
+
 ## 💻 Quick Start
 
 ### 1. Implement a Handler
@@ -61,7 +69,7 @@ To build the library, ensure you have **CMake** and a **C++17** compatible compi
 
 ## ⚖️ License
 
-[cite_start]This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version[cite: 1].
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 ---
 

@@ -26,7 +26,7 @@
 #include <unordered_map>
 
 // Library headers
-#include "ScopedFd.h"
+#include <atu_reactor/ScopedFd.h>
 
 namespace atu_reactor {
 

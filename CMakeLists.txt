@@ -39,6 +39,7 @@ add_compile_options(
 # 1. THE LIBRARY: AtuReactor
 # ---------------------------------------------------------------------------
 add_library(AtuReactor SHARED src/EventLoop.cc src/UDPReceiver.cc)
+add_library(AtuReactor::AtuReactor ALIAS AtuReactor)
 
 set_target_properties(AtuReactor PROPERTIES
     VERSION ${ATU_REACTOR_VERSION}
@@ -57,9 +58,32 @@ include(GNUInstallDirs)
 
 # 1. Install the Library (the .so files)
 install(TARGETS AtuReactor
+    EXPORT AtuReactorTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install the export set
+install(EXPORT AtuReactorTargets
+    FILE AtuReactorTargets.cmake
+    NAMESPACE AtuReactor::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/AtuReactor
+)
+
+# Create a basic Config file so find_package(AtuReactor) works
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/AtuReactorConfigVersion.cmake"
+    VERSION ${ATU_REACTOR_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+# Install the Config and Version files
+install(FILES
+    "cmake/AtuReactorConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/AtuReactorConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/AtuReactor
 )
 
 # 2. Install the Public Headers

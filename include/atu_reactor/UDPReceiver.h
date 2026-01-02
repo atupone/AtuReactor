@@ -23,10 +23,10 @@
 #include <sys/socket.h>
 
 // Library headers
-#include "EventLoop.h"
-#include "IPacketHandler.h"
-#include "ScopedFd.h"
-#include "Result.h"
+#include <atu_reactor/EventLoop.h>
+#include <atu_reactor/IPacketHandler.h>
+#include <atu_reactor/Result.h>
+#include <atu_reactor/ScopedFd.h>
 
 namespace atu_reactor {
 
