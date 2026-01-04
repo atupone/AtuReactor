@@ -24,12 +24,33 @@
 #include <memory>
 #include <set>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 // Library headers
 #include <atu_reactor/ScopedFd.h>
 
 namespace atu_reactor {
+
+using PacketHandlerFn = void(*)(void* context, const uint8_t* data, size_t len);
+
+// Forward declaration
+class EventLoop;
+class UDPReceiver;
+
+// Define the tags.
+// We use pointers here because they are "Incomplete Types"
+// which std::variant handles fine as long as they are pointers.
+struct TimerTag { EventLoop* loop; };
+struct UDPReceiverTag {
+    UDPReceiver* receiver;
+    int fd;
+    void* userContext;
+    PacketHandlerFn handler;
+};
+
+// The dispatch variant
+using InternalHandler = std::variant<std::monostate, TimerTag, UDPReceiverTag>;
 
 using Clock = std::chrono::steady_clock;
 using Timestamp = std::chrono::time_point<Clock>;
@@ -67,7 +88,7 @@ class EventLoop {
          * @param cb The function to execute when the event triggers.
          * @throws std::runtime_error if the OS fails to add the source.
          */
-        void addSource(int fd, uint32_t eventMask, void* context, EventCallbackFn cb);
+        void addSource(int fd, uint32_t eventMask, InternalHandler handler);
 
         /**
          * @brief Removes a file descriptor and its callback from the loop.
@@ -134,8 +155,7 @@ class EventLoop {
         std::unique_ptr<EpollInternal> m_impl;
 
         struct Source {
-            void* context = nullptr;
-            EventCallbackFn callback = nullptr;
+            InternalHandler handler;
         };
 
         // Maps FD -> User Callback for O(1) lookups during the event loop

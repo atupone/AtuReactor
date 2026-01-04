@@ -19,6 +19,7 @@
 #include <atu_reactor/UDPReceiver.h>
 
 // System headers
+#include <cassert>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -29,18 +30,30 @@ namespace atu_reactor {
 UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
         : m_loop(loopRef),
         m_config(config),
+        m_ownerThreadId(std::this_thread::get_id()),
         // Allocate ONE big chunk of memory for all packets
-        m_flatBuffer(config.batchSize * config.bufferSize),
         m_ioVectors(config.batchSize),
         m_msgHeaders(config.batchSize)
 {
-    // Initialize the mapping between kernel structures and our flat buffer.
+    m_alignedBufferSize = (m_config.bufferSize + 63) & ~63; // Round up to multiple of 64
+
+    // 2. Resize the buffer
+    // We add an extra 64 bytes of padding at the start to allow manual alignment
+    // if the vector doesn't start on a 64-byte boundary.
+    m_flatBuffer.resize((config.batchSize * m_alignedBufferSize) + 64);
+
+    // 3. Find the first 64-byte aligned address in our vector
+    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(m_flatBuffer.data());
+    uintptr_t alignedAddr = (rawAddr + 63) & ~63;
+    uint8_t* basePtr = reinterpret_cast<uint8_t*>(alignedAddr);
+
+    // Initialize iovecs using the aligned stride
     for (int i = 0; i < m_config.batchSize; ++i) {
         // Calculate offset into the flat buffer
-        uint8_t* currentBufferPtr = &m_flatBuffer[i * m_config.bufferSize];
+        uint8_t* packetStart = basePtr + (i * m_alignedBufferSize);
 
         // Map iovec to the specific row in our 2D vector
-        m_ioVectors[i].iov_base = currentBufferPtr;
+        m_ioVectors[i].iov_base = packetStart;
         m_ioVectors[i].iov_len = m_config.bufferSize;
 
         // Link the message header to the iovec
@@ -58,10 +71,10 @@ UDPReceiver::~UDPReceiver() {
     }
 }
 
-Result<int> UDPReceiver::subscribe(uint16_t localPort, void* context, PacketHandlerFn handler) {
+Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn handler) {
     if (handler == nullptr) return {std::error_code(EINVAL, std::system_category())};
 
-    if (m_port_to_fd_map.count(localPort))
+    if (m_port_to_fd_map.count(port))
         return {std::error_code(EADDRINUSE, std::system_category())};
 
     if (m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
@@ -80,48 +93,53 @@ Result<int> UDPReceiver::subscribe(uint16_t localPort, void* context, PacketHand
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(localPort);
+    addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
 
     if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == -1) {
         return {std::error_code(errno, std::system_category())};
     }
 
+    // Resolve the actual port (Crucial for port 0)
+    struct sockaddr_in sin;
+    socklen_t len = sizeof(sin);
+    if (getsockname(udp_socket, (struct sockaddr *)&sin, &len) == -1) {
+        return {std::error_code(errno, std::system_category())};
+    }
+    uint16_t localPort = ntohs(sin.sin_port);
+
+    // Register with the EventLoop
     int raw_fd = udp_socket;
-
-    // Create the context that will be passed to EventLoop
-    // We store this in a map to keep it alive
-    auto [it, inserted] = m_contexts.emplace(localPort,
-            PortContext{this, raw_fd, context, handler});
-
-    // Register with the EventLoop using the new 4-argument signature
-    m_loop.addSource(raw_fd, EPOLLIN, &it->second, &UDPReceiver::onFdReady);
+    m_loop.addSource(raw_fd, EPOLLIN, UDPReceiverTag{
+        this,
+        raw_fd,
+        context,
+        handler
+    });
 
     // Move ownership of ScopedFd to our map
     m_port_to_fd_map.emplace(localPort, std::move(udp_socket));
 
-    return {raw_fd};
+    return {static_cast<int>(localPort)};
 }
 
 void UDPReceiver::unsubscribe(int localPort) {
     auto it = m_port_to_fd_map.find(localPort);
     if (it != m_port_to_fd_map.end()) {
         // Remove from epoll first to stop callbacks
-        m_loop.removeSource(it->second);
+        m_loop.removeSource(it->second.fd);
 
         // Erasing from map triggers ScopedFd destructor, closing the socket
         m_port_to_fd_map.erase(it);
-        m_contexts.erase(localPort);
     }
 }
 
-// 2. Implement the static bridge
-void UDPReceiver::onFdReady(void* ctx, uint32_t) {
-    auto* pCtx = static_cast<PortContext*>(ctx);
-    pCtx->parent->handleRead(pCtx->fd, pCtx->userContext, pCtx->handler);
-}
-
+// NOTE: handleRead assumes exclusive access to m_flatBuffer.
+// If multiple threads trigger handleRead simultaneously via different
+// EventLoops, data corruption will occur.
 void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
+    assert(std::this_thread::get_id() == m_ownerThreadId && 
+            "UDPReceiver handled on wrong thread!");
     // recvmmsg allows us to grab up to BATCH_SIZE packets in one go.
     // MSG_DONTWAIT ensures we don't block if the buffer was emptied by a race condition.
     int numPackets = recvmmsg(
@@ -129,12 +147,16 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
             MSG_DONTWAIT, nullptr);
     if (numPackets < 0) return;
 
+    // Get the same aligned base pointer we calculated in the constructor
+    uintptr_t alignedAddr = (reinterpret_cast<uintptr_t>(m_flatBuffer.data()) + 63) & ~63;
+    uint8_t* basePtr = reinterpret_cast<uint8_t*>(alignedAddr);
+
     // Iterate through only the number of packets actually received
     for (int k = 0; k < numPackets; ++k) {
         size_t len = m_msgHeaders[k].msg_len;
         if (len > 0) {
             // Data is at the specific offset in the flat buffer
-            uint8_t* packetData = &m_flatBuffer[k * m_config.bufferSize];
+            uint8_t* packetData = basePtr + (k * m_alignedBufferSize);
             // Dispatch the packet to the user-defined handler
             handler(context, packetData, len);
         }

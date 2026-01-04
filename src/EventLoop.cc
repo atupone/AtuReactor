@@ -24,6 +24,9 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 
+// Library headers
+#include <atu_reactor/UDPReceiver.h>
+
 namespace atu_reactor {
 
 struct EventLoop::EpollInternal {
@@ -47,9 +50,7 @@ EventLoop::EventLoop()
     m_sources.resize(MAX_FDS);
 
     // Register the timer FD into the epoll loop immediately
-    addSource(m_timer_fd, EPOLLIN, this, [](void* ctx, uint32_t) {
-        static_cast<EventLoop*>(ctx)->handleTimerRead();
-    });
+    addSource(m_timer_fd, EPOLLIN, TimerTag{this});
 }
 
 /**
@@ -59,24 +60,29 @@ EventLoop::EventLoop()
  */
 EventLoop::~EventLoop() = default;
 
-void EventLoop::addSource(int fd, uint32_t eventMask, void* context, EventCallbackFn cb) {
+void EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler handler) {
     if (fd < 0 || fd >= static_cast<int>(m_sources.size()))
         throw std::runtime_error("FD out of range");
 
+    // Store the callback in our local map
+    m_sources[fd].handler = handler;
+
     struct epoll_event ev{};
     ev.events = eventMask;
-    ev.data.fd = fd; // Store the FD in data so we can find it in the callback map later
+
+    // Point epoll directly to the memory address of this source
+    ev.data.ptr = &m_sources[fd];
 
     // Tell the kernel to start monitoring this FD
     if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
         throw std::runtime_error("EventLoop: epoll_ctl ADD failed for FD " + std::to_string(fd));
     }
-
-    // Store the callback in our local map
-    m_sources[fd] = Source{context, cb};
 }
 
 void EventLoop::removeSource(int fd) {
+    if (fd < 0 || fd >= static_cast<int>(m_sources.size()))
+        throw std::runtime_error("FD out of range");
+
     // Tell the kernel to stop monitoring this FD.
     // Note: Some older kernels require non-null event even for DEL.
     if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
@@ -87,7 +93,7 @@ void EventLoop::removeSource(int fd) {
     }
 
     // Clean up local resources
-    m_sources[fd] = Source{};
+    m_sources[fd].handler = std::monostate{};
 }
 
 void EventLoop::runOnce(int timeoutMs) {
@@ -103,13 +109,22 @@ void EventLoop::runOnce(int timeoutMs) {
 
     // Iterate only through the number of file descriptors that actually have events
     for (int i = 0; i < ready; ++i) {
-        int fd = m_impl->events[i].data.fd;
-        uint32_t triggeredEvents = m_impl->events[i].events;
+        // Retrieve the pointer we saved earlier
+        Source* source = static_cast<Source*>(m_impl->events[i].data.ptr);
 
-        const auto& source = m_sources[fd];
-        if (source.callback) {
-            source.callback(source.context, triggeredEvents);
-        }
+        // 2. Dispatch using the pointer
+        std::visit([this](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+
+            if constexpr (std::is_same_v<T, TimerTag>) {
+                // Timers generally only trigger on EPOLLIN,
+                // but we call it normally.
+                handleTimerRead();
+            } else if constexpr (std::is_same_v<T, UDPReceiverTag>) {
+                // Pass the event to the receiver
+                arg.receiver->handleRead(arg.fd, arg.userContext, arg.handler);
+            }
+        }, source->handler);
     }
 }
 
@@ -154,26 +169,32 @@ void EventLoop::insertTimer(Timer t) {
 }
 
 void EventLoop::resetTimerFd() {
-    struct itimerspec newValue{};
-    struct itimerspec oldValue{};
-
-    if (!m_timers.empty()) {
-        auto nextExpire = m_timers.begin()->expiration;
-        auto now = Clock::now();
-
-        // Calculate delay from now until next expiration
-        auto delay = std::chrono::duration_cast<std::chrono::microseconds>(nextExpire - now);
-        if (delay.count() < 100) delay = std::chrono::microseconds(100); // Minimum 100us safety
-
-        newValue.it_value.tv_sec = delay.count() / 1000000;
-        newValue.it_value.tv_nsec = (delay.count() % 1000000) * 1000;
-    } else {
-        // No timers: disarm the timerfd
-        newValue.it_value.tv_sec = 0;
-        newValue.it_value.tv_nsec = 0;
+    if (m_timers.empty()) {
+        // Disarm timer
+        struct itimerspec newValue{};
+        timerfd_settime(m_timer_fd, 0, &newValue, nullptr);
+        return;
     }
 
-    timerfd_settime(m_timer_fd, 0, &newValue, &oldValue);
+    auto now = Clock::now();
+    auto expiration = m_timers.begin()->expiration;
+
+    struct itimerspec newValue{};
+
+    if (expiration <= now) {
+        // Timer already expired! Set to smallest non-zero value
+        // to trigger the epoll loop immediately.
+        newValue.it_value.tv_sec = 0;
+        newValue.it_value.tv_nsec = 1;
+    } else {
+        // Calculate delay from now until next expiration
+        auto dur = expiration - now;
+        newValue.it_value.tv_sec = std::chrono::duration_cast<std::chrono::seconds>(dur).count();
+        newValue.it_value.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count() % 1'000'000'000;
+    }
+
+    // Using Absolute Time is safer against system clock drift
+    timerfd_settime(m_timer_fd, TFD_TIMER_ABSTIME, &newValue, nullptr);
 }
 
 void EventLoop::handleTimerRead() {

@@ -18,16 +18,15 @@
 #pragma once
 
 // System headers
-#include <vector>
 #include <map>
 #include <sys/socket.h>
+#include <thread>
+#include <vector>
 
 // Library headers
 #include <atu_reactor/EventLoop.h>
 #include <atu_reactor/Result.h>
 #include <atu_reactor/ScopedFd.h>
-
-using PacketHandlerFn = void(*)(void* context, const uint8_t* data, size_t len);
 
 namespace atu_reactor {
 
@@ -42,9 +41,16 @@ struct ReceiverConfig {
 
 /**
  * @class UDPReceiver
- * @brief Manages multiple UDP sockets using an EventLoop for asynchronous reception.
+ * @brief Manages multiple UDP sockets using an EventLoop.
+ * * @note This class is THREAD-HOSTILE. It uses internal shared buffers
+ * (m_flatBuffer) for high-performance batch reading. All methods,
+ * including subscription and the eventual EventLoop::runOnce() dispatch,
+ * MUST be executed on the same thread.
  */
 class UDPReceiver {
+    // Grant EventLoop access to private members like handleRead
+    friend class EventLoop;
+
     public:
         /**
          * @brief Constructor
@@ -77,16 +83,6 @@ class UDPReceiver {
         UDPReceiver& operator=(UDPReceiver&&) = delete;
 
     private:
-        struct PortContext {
-            UDPReceiver* parent;
-            int fd;              // The raw FD for this port
-            void* userContext;   // The 'this' pointer from the app
-            PacketHandlerFn handler; // The static callback function
-        };
-
-        // Static bridge for the EventLoop
-        static void onFdReady(void* ctx, uint32_t events);
-
         /**
          * @brief Internal callback triggered by EventLoop when a socket has data.
          */
@@ -94,11 +90,11 @@ class UDPReceiver {
 
         EventLoop& m_loop;
         ReceiverConfig m_config;
+        size_t m_alignedBufferSize; // Added for cache-line alignment
+        std::thread::id m_ownerThreadId; // Added for thread-safety asserts
 
         // Maps port -> ScopedFd. RAII ensures sockets close on removal.
         std::map<int, ScopedFd> m_port_to_fd_map;
-        // Storage for PortContext to ensure pointers passed to EventLoop remain valid
-        std::map<int, PortContext> m_contexts;
 
         // Single contiguous buffer for all packets to improve cache locality
         std::vector<uint8_t> m_flatBuffer;
