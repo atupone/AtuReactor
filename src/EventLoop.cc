@@ -193,24 +193,22 @@ void EventLoop::handleTimerRead() {
     // 1. Extract all expired timers from the set
     std::vector<Timer> expired;
     while (!m_timers.empty() && m_timers.begin()->expiration <= now) {
-        expired.push_back(*m_timers.begin());
-        m_activeTimers.erase(m_timers.begin()->id);
-        m_timers.erase(m_timers.begin());
+        auto it = m_timers.begin();
+        expired.push_back(std::move(*it));
+        m_activeTimers.erase(it->id);
+        m_timers.erase(it);
     }
 
     // 2. Execute callbacks
-    for (const auto& t : expired) {
+    for (auto& t : expired) {
         if (t.callback) {
-            try {
-                t.callback();
-            } catch(...) { /* Log error */ }
+            t.callback();
         }
 
         // 3. Re-schedule if repeating
         if (t.repeat) {
-            Timer nextTimer = t;
-            nextTimer.expiration = now + t.interval;
-            insertTimer(std::move(nextTimer));
+            t.expiration += t.interval;
+            insertTimer(t);
         }
     }
 
