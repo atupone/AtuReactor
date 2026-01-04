@@ -24,6 +24,7 @@
 #include <memory>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 // Library headers
 #include <atu_reactor/ScopedFd.h>
@@ -37,6 +38,8 @@ using Duration = std::chrono::milliseconds;
 // ID to track and cancel timers
 using TimerId = uint64_t;
 
+using EventCallbackFn = void(*)(void* context, uint32_t events);
+
 /**
  * @class EventLoop
  * @brief A lightweight wrapper around Linux epoll for asynchronous I/O multiplexing.
@@ -46,7 +49,6 @@ using TimerId = uint64_t;
 class EventLoop {
     public:
         // Callback signature: takes a uint32_t representing the triggered epoll events.
-        using EventCallback = std::function<void(uint32_t)>;
         using TimerCallback = std::function<void()>;
 
         /**
@@ -65,7 +67,7 @@ class EventLoop {
          * @param cb The function to execute when the event triggers.
          * @throws std::runtime_error if the OS fails to add the source.
          */
-        void addSource(int fd, uint32_t eventMask, EventCallback cb);
+        void addSource(int fd, uint32_t eventMask, void* context, EventCallbackFn cb);
 
         /**
          * @brief Removes a file descriptor and its callback from the loop.
@@ -122,6 +124,7 @@ class EventLoop {
         void insertTimer(Timer t);
 
         static constexpr int MAX_EVENTS = 128; // Buffer size for events returned per wait
+        static constexpr int MAX_FDS = 1024; // Limit for direct indexing
 
         // RAII wrapper for the epoll instance file descriptor
         ScopedFd m_epoll_fd;
@@ -130,8 +133,13 @@ class EventLoop {
         struct EpollInternal;
         std::unique_ptr<EpollInternal> m_impl;
 
+        struct Source {
+            void* context = nullptr;
+            EventCallbackFn callback = nullptr;
+        };
+
         // Maps FD -> User Callback for O(1) lookups during the event loop
-        std::unordered_map<int, EventCallback> m_callbacks;
+        std::vector<Source> m_sources;
 
         // Ordered queue of pending timers
         std::set<Timer> m_timers;

@@ -20,7 +20,6 @@
 
 // System headers
 #include <errno.h>
-#include <iostream>
 #include <stdexcept>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -45,9 +44,11 @@ EventLoop::EventLoop()
     if (m_epoll_fd < 0) throw std::runtime_error("Failed to create epoll");
     if (m_timer_fd < 0) throw std::runtime_error("Failed to create timerfd");
 
+    m_sources.resize(MAX_FDS);
+
     // Register the timer FD into the epoll loop immediately
-    addSource(m_timer_fd, EPOLLIN, [this](uint32_t) {
-        this->handleTimerRead();
+    addSource(m_timer_fd, EPOLLIN, this, [](void* ctx, uint32_t) {
+        static_cast<EventLoop*>(ctx)->handleTimerRead();
     });
 }
 
@@ -58,7 +59,10 @@ EventLoop::EventLoop()
  */
 EventLoop::~EventLoop() = default;
 
-void EventLoop::addSource(int fd, uint32_t eventMask, EventCallback cb) {
+void EventLoop::addSource(int fd, uint32_t eventMask, void* context, EventCallbackFn cb) {
+    if (fd < 0 || fd >= static_cast<int>(m_sources.size()))
+        throw std::runtime_error("FD out of range");
+
     struct epoll_event ev{};
     ev.events = eventMask;
     ev.data.fd = fd; // Store the FD in data so we can find it in the callback map later
@@ -69,7 +73,7 @@ void EventLoop::addSource(int fd, uint32_t eventMask, EventCallback cb) {
     }
 
     // Store the callback in our local map
-    m_callbacks[fd] = std::move(cb);
+    m_sources[fd] = Source{context, cb};
 }
 
 void EventLoop::removeSource(int fd) {
@@ -83,7 +87,7 @@ void EventLoop::removeSource(int fd) {
     }
 
     // Clean up local resources
-    m_callbacks.erase(fd);
+    m_sources[fd] = Source{};
 }
 
 void EventLoop::runOnce(int timeoutMs) {
@@ -102,18 +106,9 @@ void EventLoop::runOnce(int timeoutMs) {
         int fd = m_impl->events[i].data.fd;
         uint32_t triggeredEvents = m_impl->events[i].events;
 
-        auto it = m_callbacks.find(fd);
-        if (it != m_callbacks.end()) {
-            try {
-                // Execute callback safely
-                it->second(triggeredEvents);
-            } catch (const std::exception& e) {
-                // Log error but keep loop alive
-                std::cerr << "EventLoop: Exception in callback for FD " << fd
-                    << ": " << e.what() << std::endl;
-            } catch (...) {
-                std::cerr << "EventLoop: Unknown exception in callback for FD " << fd << std::endl;
-            }
+        const auto& source = m_sources[fd];
+        if (source.callback) {
+            source.callback(source.context, triggeredEvents);
         }
     }
 }

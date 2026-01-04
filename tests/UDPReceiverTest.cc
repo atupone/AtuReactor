@@ -18,7 +18,6 @@
 #include <gtest/gtest.h>
 #include <atu_reactor/UDPReceiver.h>
 #include <atu_reactor/EventLoop.h>
-#include <atu_reactor/IPacketHandler.h>
 
 #include <thread>
 #include <vector>
@@ -31,7 +30,7 @@
 using namespace atu_reactor;
 
 // --- Mock Handler for Verification ---
-class MockPacketHandler : public IPacketHandler {
+class MockPacketHandler {
 public:
     struct ReceivedPacket {
         std::vector<uint8_t> data;
@@ -40,8 +39,13 @@ public:
 
     std::vector<ReceivedPacket> receivedPackets;
 
-    void handlePacket(const uint8_t data[], size_t size) override {
+    void handlePacket(const uint8_t data[], size_t size) {
         receivedPackets.push_back({std::vector<uint8_t>(data, data + size), size});
+    }
+
+    // Static bridge function required by the new UDPReceiver API
+    static void onPacket(void* context, const uint8_t* data, size_t len) {
+        static_cast<MockPacketHandler*>(context)->handlePacket(data, len);
     }
 
     void clear() { receivedPackets.clear(); }
@@ -72,10 +76,11 @@ protected:
 
 // --- Test Cases ---
 
-// 1. Verify fix for the Critical Bug: iov_len
+// 1. Verify Packet Reception
 TEST_F(UDPReceiverTest, ReceivesLargePacketCorrectly) {
     UDPReceiver receiver(loop);
-    ASSERT_TRUE(receiver.subscribe(TEST_PORT, &handler));
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(static_cast<bool>(result));
 
     // Create a packet larger than the batch size (64) but smaller than buffer (2048)
     // If the bug exists (iov_len = batchSize), this packet will be truncated to 64 bytes.
@@ -97,7 +102,8 @@ TEST_F(UDPReceiverTest, HandlesBurstOfPackets) {
     ReceiverConfig config;
     config.batchSize = 10; // Configure small batch for testing
     UDPReceiver receiver(loop, config);
-    ASSERT_TRUE(receiver.subscribe(TEST_PORT, &handler));
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(static_cast<bool>(result));
 
     int packetCount = 5;
     for(int i=0; i < packetCount; ++i) {
@@ -116,7 +122,8 @@ TEST_F(UDPReceiverTest, HandlesBurstOfPackets) {
 TEST_F(UDPReceiverTest, SafeDestruction) {
     {
         UDPReceiver receiver(loop);
-        ASSERT_TRUE(receiver.subscribe(TEST_PORT, &handler));
+        auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+        ASSERT_TRUE(static_cast<bool>(result));
         // Receiver goes out of scope here
     }
 

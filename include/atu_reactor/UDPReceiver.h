@@ -24,9 +24,10 @@
 
 // Library headers
 #include <atu_reactor/EventLoop.h>
-#include <atu_reactor/IPacketHandler.h>
 #include <atu_reactor/Result.h>
 #include <atu_reactor/ScopedFd.h>
+
+using PacketHandlerFn = void(*)(void* context, const uint8_t* data, size_t len);
 
 namespace atu_reactor {
 
@@ -61,7 +62,7 @@ class UDPReceiver {
          * @param handler Callback object for processed packets.
          * @return true if socket was successfully created and registered.
          */
-        [[nodiscard]] Result<int> subscribe(uint16_t localPort, IPacketHandler* handler);
+        [[nodiscard]] Result<int> subscribe(uint16_t localPort, void* context, PacketHandlerFn handler);
 
         /**
          * @brief Closes the socket for a port and removes it from the EventLoop.
@@ -76,16 +77,28 @@ class UDPReceiver {
         UDPReceiver& operator=(UDPReceiver&&) = delete;
 
     private:
+        struct PortContext {
+            UDPReceiver* parent;
+            int fd;              // The raw FD for this port
+            void* userContext;   // The 'this' pointer from the app
+            PacketHandlerFn handler; // The static callback function
+        };
+
+        // Static bridge for the EventLoop
+        static void onFdReady(void* ctx, uint32_t events);
+
         /**
          * @brief Internal callback triggered by EventLoop when a socket has data.
          */
-        void handleRead(int fd, IPacketHandler* handler);
+        void handleRead(int fd, void* context, PacketHandlerFn handler);
 
         EventLoop& m_loop;
         ReceiverConfig m_config;
 
         // Maps port -> ScopedFd. RAII ensures sockets close on removal.
         std::map<int, ScopedFd> m_port_to_fd_map;
+        // Storage for PortContext to ensure pointers passed to EventLoop remain valid
+        std::map<int, PortContext> m_contexts;
 
         // Single contiguous buffer for all packets to improve cache locality
         std::vector<uint8_t> m_flatBuffer;

@@ -8,32 +8,36 @@
  * This example is part of the AtuReactor project.
  */
 
-#include <atu_reactor/EventLoop.h>    //
-#include <atu_reactor/UDPReceiver.h>  //
-#include <atu_reactor/IPacketHandler.h> //
+#include <atu_reactor/EventLoop.h>
+#include <atu_reactor/UDPReceiver.h>
 #include <iostream>
 
 using namespace atu_reactor;
 
 // A simple handler that just prints packet info
-class EchoHandler : public IPacketHandler {
+class EchoHandler {
 public:
-    void handlePacket(const uint8_t* data, size_t size) override {
+    void onData(const uint8_t*, size_t size) {
         std::cout << "Received " << size << " bytes" << std::endl;
         // You could process data here
+    }
+
+    // THE BRIDGE: Matches PacketHandlerFn signature
+    static void onPacketReceived(void* context, const uint8_t* data, size_t len) {
+        static_cast<EchoHandler*>(context)->onData(data, len);
     }
 };
 
 int main() {
     try {
-        EventLoop loop;               //
-        UDPReceiver receiver(loop);   //
+        EventLoop loop;
+        UDPReceiver receiver(loop);
         EchoHandler myHandler;
 
         uint16_t port = 12345;
 
         // Register our handler for UDP port 12345
-        auto result = receiver.subscribe(port, &myHandler);
+        auto result = receiver.subscribe(port, &myHandler, &EchoHandler::onPacketReceived);
 
         if (!result) {
             std::cerr << "Failed to start Echo Server: "

@@ -18,7 +18,7 @@ cmake_minimum_required(VERSION 3.10)
 project(AtuReactor LANGUAGES CXX)
 
 # Define the version and compatibility version
-set(ATU_REACTOR_VERSION 0.0.3)
+set(ATU_REACTOR_VERSION 0.0.4)
 set(ATU_REACTOR_SOVERSION 0)
 
 # Force C++17 standard
@@ -97,6 +97,32 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/examples/
 )
 
 # ---------------------------------------------------------------------------
+# EXAMPLES
+# ---------------------------------------------------------------------------
+option(BUILD_EXAMPLES "Build the example programs" OFF)
+
+if(BUILD_EXAMPLES)
+    # 1. Simple Echo Server
+    add_executable(example_echo examples/simple_echo.cc)
+    target_link_libraries(example_echo PRIVATE AtuReactor)
+    target_include_directories(example_echo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    # 2. Multi-port Gateway
+    add_executable(example_gateway examples/multi_port_gateway.cc)
+    target_link_libraries(example_gateway PRIVATE AtuReactor)
+    target_include_directories(example_gateway PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    # 3. Timer Usage
+    add_executable(example_timers examples/TimerUsage.cc)
+    target_link_libraries(example_timers PRIVATE AtuReactor)
+    target_include_directories(example_timers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    message(STATUS "Example programs are enabled")
+else()
+    message(STATUS "Example programs are disabled (Use -DBUILD_EXAMPLES=ON to enable)")
+endif()
+
+# ---------------------------------------------------------------------------
 # TEST SUITE
 # ---------------------------------------------------------------------------
 
@@ -122,6 +148,7 @@ if(BUILD_TESTING)
 else()
     message(STATUS "Unit tests are disabled (Use -DBUILD_TESTING=ON to enable)")
 endif()
+
 
 # Local Variables: ***
 # tab-width: 4 ***

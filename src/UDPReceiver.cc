@@ -58,14 +58,11 @@ UDPReceiver::~UDPReceiver() {
     }
 }
 
-Result<int> UDPReceiver::subscribe(uint16_t localPort, IPacketHandler* handler) {
-    if (handler == nullptr) {
-        return {std::error_code(EINVAL, std::system_category())};
-    }
+Result<int> UDPReceiver::subscribe(uint16_t localPort, void* context, PacketHandlerFn handler) {
+    if (handler == nullptr) return {std::error_code(EINVAL, std::system_category())};
 
-    if (m_port_to_fd_map.count(localPort)) {
+    if (m_port_to_fd_map.count(localPort))
         return {std::error_code(EADDRINUSE, std::system_category())};
-    }
 
     if (m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
         return {std::error_code(EMFILE, std::system_category())};
@@ -73,9 +70,7 @@ Result<int> UDPReceiver::subscribe(uint16_t localPort, IPacketHandler* handler) 
 
     // Initialize IPv4 UDP socket
     ScopedFd udp_socket(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    if (udp_socket < 0) {
-        return {std::error_code(errno, std::system_category())};
-    }
+    if (udp_socket < 0) return {std::error_code(errno, std::system_category())};
 
     // Reuse Address: Allows immediate restart of the application
     int optval = 1;
@@ -93,13 +88,14 @@ Result<int> UDPReceiver::subscribe(uint16_t localPort, IPacketHandler* handler) 
     }
 
     int raw_fd = udp_socket;
-    try {
-        m_loop.addSource(raw_fd, EPOLLIN, [this, raw_fd, handler](uint32_t) {
-            this->handleRead(raw_fd, handler);
-        });
-    } catch (const std::exception& e) {
-        return {std::error_code(ECONNREFUSED, std::system_category())};
-    }
+
+    // Create the context that will be passed to EventLoop
+    // We store this in a map to keep it alive
+    auto [it, inserted] = m_contexts.emplace(localPort,
+            PortContext{this, raw_fd, context, handler});
+
+    // Register with the EventLoop using the new 4-argument signature
+    m_loop.addSource(raw_fd, EPOLLIN, &it->second, &UDPReceiver::onFdReady);
 
     // Move ownership of ScopedFd to our map
     m_port_to_fd_map.emplace(localPort, std::move(udp_socket));
@@ -115,10 +111,17 @@ void UDPReceiver::unsubscribe(int localPort) {
 
         // Erasing from map triggers ScopedFd destructor, closing the socket
         m_port_to_fd_map.erase(it);
+        m_contexts.erase(localPort);
     }
 }
 
-void UDPReceiver::handleRead(int fd, IPacketHandler* handler) {
+// 2. Implement the static bridge
+void UDPReceiver::onFdReady(void* ctx, uint32_t) {
+    auto* pCtx = static_cast<PortContext*>(ctx);
+    pCtx->parent->handleRead(pCtx->fd, pCtx->userContext, pCtx->handler);
+}
+
+void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
     // recvmmsg allows us to grab up to BATCH_SIZE packets in one go.
     // MSG_DONTWAIT ensures we don't block if the buffer was emptied by a race condition.
     int numPackets = recvmmsg(
@@ -133,7 +136,7 @@ void UDPReceiver::handleRead(int fd, IPacketHandler* handler) {
             // Data is at the specific offset in the flat buffer
             uint8_t* packetData = &m_flatBuffer[k * m_config.bufferSize];
             // Dispatch the packet to the user-defined handler
-            handler->handlePacket(packetData, len);
+            handler(context, packetData, len);
         }
     }
 }

@@ -10,18 +10,22 @@
 
 #include <atu_reactor/EventLoop.h>
 #include <atu_reactor/UDPReceiver.h>
-#include <atu_reactor/IPacketHandler.h>
 #include <iostream>
 
 using namespace atu_reactor;
 
-class GenericHandler : public IPacketHandler {
+class GenericHandler {
     std::string m_label;
 public:
     explicit GenericHandler(std::string label) : m_label(std::move(label)) {}
 
-    void handlePacket(const uint8_t* data, size_t size) override {
+    void process(const uint8_t*, size_t size) {
         std::cout << "[Channel: " << m_label << "] Received " << size << " bytes." << std::endl;
+    }
+
+    // Static bridge function
+    static void bridge(void* context, const uint8_t* data, size_t len) {
+        static_cast<GenericHandler*>(context)->process(data, len);
     }
 };
 
@@ -34,12 +38,12 @@ int main() {
         GenericHandler streamA("PRIMARY_RADAR");
         GenericHandler streamB("SECONDARY_DATA");
 
-        auto resA = receiver.subscribe(5001, &streamA);
+        auto resA = receiver.subscribe(5001, &streamA, &GenericHandler::bridge);
         if (!resA) {
             std::cerr << "Stream A failed: " << resA.error().message() << std::endl;
         }
 
-        auto resB = receiver.subscribe(5002, &streamB);
+        auto resB = receiver.subscribe(5002, &streamB, &GenericHandler::bridge);
         if (!resB) {
             std::cerr << "Stream B failed: " << resB.error().message() << std::endl;
         }
