@@ -2,74 +2,121 @@
 
 **AtuReactor** is a lightweight, high-performance Linux-native C++17 library designed for low-latency UDP packet processing. It implements the **Reactor Pattern** to provide an efficient, event-driven architecture.
 
-
-
 ---
 
 ## 🚀 Key Features
 
-* **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with O(1) scalability.
+* **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with $O(1)$ scalability.
 * **Batch UDP Reception**: Utilizes `recvmmsg` to pull multiple packets from the kernel in a single system call.
+* **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to improve cache locality during high-throughput processing.
 * **Resource Safety**: Full RAII implementation using `ScopedFd` to ensure system file descriptors are never leaked.
-* **Precision Timers**: Native support for high-resolution timers via Linux `timerfd`.
+* **Precision Timers**: Native support for high-resolution one-shot and periodic timers via Linux `timerfd`.
 
 ---
-
-## Integration
-If you have installed the library, add this to your `CMakeLists.txt`:
-
-```cmake
-find_package(AtuReactor REQUIRED)
-target_link_libraries(my_project PRIVATE AtuReactor::AtuReactor)
-```
 
 ## 💻 Quick Start
 
-### 1. Implement a Handler
-Inherit from `IPacketHandler` to define how your application processes incoming data.
+### 1. Define a Callback
+AtuReactor uses a C-style function pointer for packet handling to minimize abstraction overhead.
 
-    #include <atu_reactor/IPacketHandler.h>
-    #include <iostream>
+```cpp
+#include <atu_reactor/UDPReceiver.h>
+#include <iostream>
 
-    class MyHandler : public atu_reactor::IPacketHandler {
-    public:
-        void handlePacket(const uint8_t data[], size_t size) override {
-            std::cout << "Received packet of size: " << size << std::endl;
-        }
-    };
-
+// Callback signature: void(*)(void* context, const uint8_t* data, size_t len)
+void onPacketReceived(void* context, const uint8_t* data, size_t size) {
+    std::cout << "Received " << size << " bytes" << std::endl;
+}
+```
 ### 2. Run the Event Loop
-This setup demonstrates the coordination between the Reactor (`EventLoop`) and the Handler.
+Register your handler and enter the dispatch loop. The `subscribe` method returns a `Result<int>` containing the bound port.
 
-    #include <atu_reactor/EventLoop.h>
-    #include <atu_reactor/UDPReceiver.h>
+```cpp
+#include <atu_reactor/EventLoop.h>
+#include <atu_reactor/UDPReceiver.h>
 
-    int main() {
-        atu_reactor::EventLoop loop;
-        atu_reactor::UDPReceiver receiver(loop);
-        MyHandler handler;
+int main() {
+    atu_reactor::EventLoop loop;
+    atu_reactor::UDPReceiver receiver(loop);
 
-        receiver.subscribe(8080, &handler);
-        loop.run();
-
-        return 0;
+    // Subscribe to port 8080. Returns Result<int>
+    auto result = receiver.subscribe(8080, nullptr, onPacketReceived);
+    
+    if (!result) {
+        std::cerr << "Error: " << result.error().message() << std::endl;
+        return 1;
     }
 
+    // Process events. runOnce() takes a timeout in milliseconds
+    // Use -1 for infinite wait
+    while (true) {
+        loop.runOnce(-1);
+    }
+
+    return 0;
+}
+```
 ---
+### 3. Using Timers
+The reactor supports scheduling tasks directly within the event loop without managing separate threads. All timers are managed using Linux `timerfd` for high precision.
+
+```cpp
+// Run a callback once after a 500ms delay
+loop.runAfter(std::chrono::milliseconds(500), []() {
+    std::cout << "One-shot timer expired" << std::endl;
+});
+
+// Run a callback periodically every 1 second
+loop.runEvery(std::chrono::seconds(1), []() {
+    std::cout << "Periodic heartbeat" << std::endl;
+});
+```
+
+---
+## ⚠️ Threading Model
+
+**AtuReactor is Thread-Hostile by design.**
+
+To achieve maximum performance and minimize latency, the library avoids internal locking and utilizes shared memory structures (like `m_flatBuffer`).
+
+* **Single-Threaded Execution**: All interactions with a specific `EventLoop` or `UDPReceiver` instance—including `subscribe`, `runOnce`, and timer registrations—**must** occur on the same thread that constructed the object.
+* **Safety Checks**: In debug builds, the library uses `m_ownerThreadId` and `assert` statements to detect and prevent cross-thread access.
+* **Scalability**: If you need to utilize multiple CPU cores, you should instantiate one `EventLoop` and one `UDPReceiver` per thread (the "thread-per-core" pattern).
+
+
+
+> **Note**: Sharing a `UDPReceiver` across multiple `EventLoop` instances will cause immediate data corruption in the packet buffers.
+
+---
+
 ## ⚙️ Building and Installing
 
-To build the library, ensure you have **CMake** and a **C++17** compatible compiler installed.
+To build the library, ensure you have **CMake 3.10+** and a **C++17** compatible compiler (like GCC 8+ or Clang 7+) installed on a Linux system.
 
-    mkdir build && cd build
-    cmake ..
-    make
-    sudo make install
+```bash
+# 1. Clone the repository
+git clone [https://github.com/your-repo/AtuReactor.git](https://github.com/your-repo/AtuReactor.git)
+cd AtuReactor
 
+# 2. Create a build directory
+mkdir build && cd build
+
+# 3. Configure and build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# 4. Install headers and library (optional)
+sudo make install
+```
 ---
 
 ## ⚖️ License
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+**AtuReactor** is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License** as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but **WITHOUT ANY WARRANTY**; without even the implied warranty of **MERCHANTABILITY** or **FITNESS FOR A PARTICULAR PURPOSE**. See the [GNU General Public License](https://www.gnu.org/licenses/) for more details.
+
+Copyright (C) 2026 Alfredo Tupone.
 
 ---
 
