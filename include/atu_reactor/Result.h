@@ -25,34 +25,92 @@
 namespace atu_reactor {
 
 /**
+ * @brief Exception thrown when accessing a Result that contains an error.
+ */
+class BadResultAccess : public std::runtime_error {
+    public:
+        explicit BadResultAccess(std::error_code ec)
+            : std::runtime_error("Bad Result access: " + ec.message()), m_ec(ec) {}
+
+        std::error_code error() const noexcept { return m_ec; }
+    private:
+        std::error_code m_ec;
+};
+
+/**
  * @brief A lightweight wrapper to hold either a value or an error code.
  * Replaces exceptions for expected failures in the hot path.
  */
 template <typename T>
-    class Result {
-        public:
-            // Success constructor
-            Result(T value) : m_data(std::move(value)) {}
+class Result {
+    public:
+        // Success constructor
+        Result(T value) : m_data(std::move(value)) {}
 
-            // Error constructor
-            Result(std::error_code ec) : m_data(ec) {}
+        // Error constructor
+        Result(std::error_code ec) : m_data(ec) {}
 
-            bool has_value() const { return std::holds_alternative<T>(m_data); }
-            explicit operator bool() const { return has_value(); }
+        bool has_value() const noexcept { return std::holds_alternative<T>(m_data); }
+        explicit operator bool() const noexcept { return has_value(); }
 
-            const T& value() const {
-                if (!has_value())
-                    throw std::get<std::error_code>(m_data).default_error_condition().message();
-                return std::get<T>(m_data);
+        const T& value() const {
+            if (!has_value()) {
+                throw BadResultAccess(std::get<std::error_code>(m_data));
             }
+            return std::get<T>(m_data);
+        }
 
-            std::error_code error() const {
-                return std::get<std::error_code>(m_data);
+        T& value() {
+            if (!has_value()) {
+                throw BadResultAccess(std::get<std::error_code>(m_data));
             }
+            return std::get<T>(m_data);
+        }
 
-        private:
-            std::variant<T, std::error_code> m_data;
-    };
+        // Error Access
+        std::error_code error() const noexcept {
+            if (has_value()) return {};
+            return std::get<std::error_code>(m_data);
+        }
+
+        // Functional style: value_or
+        T value_or(T&& default_value) {
+            return has_value() ? std::get<T>(m_data) : std::forward<T>(default_value);
+        }
+
+    private:
+        std::variant<T, std::error_code> m_data;
+};
+
+/**
+ * @brief Specialization for void results (Success/Failure only).
+ */
+template <>
+class Result<void> {
+    public:
+        // Success constructor (default)
+        Result() : m_ec({}) {}
+
+        // Error constructor
+        Result(std::error_code ec) : m_ec(ec) {}
+
+        // Static helpers for clarity
+        static Result success() { return Result(); }
+        static Result fail(std::error_code ec) { return Result(ec); }
+
+        bool has_value() const noexcept { return !m_ec; }
+        explicit operator bool() const noexcept { return has_value(); }
+
+        // value() for void just checks for errors and throws if present
+        void value() const {
+            if (m_ec) throw BadResultAccess(m_ec);
+        }
+
+        std::error_code error() const noexcept { return m_ec; }
+
+    private:
+        std::error_code m_ec;
+};
 
 } // namespace atu_reactor
 

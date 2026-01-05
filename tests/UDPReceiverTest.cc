@@ -59,13 +59,13 @@ protected:
     const uint16_t TEST_PORT = 12345;
 
     // Helper to send raw UDP packets
-    void sendUdpPacket(const std::vector<uint8_t>& data) {
+    void sendUdpPacket(const std::vector<uint8_t>& data, uint16_t port) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         ASSERT_GE(sock, 0);
 
         struct sockaddr_in destAddr{};
         destAddr.sin_family = AF_INET;
-        destAddr.sin_port = htons(TEST_PORT);
+        destAddr.sin_port = htons(port);
         inet_pton(AF_INET, "127.0.0.1", &destAddr.sin_addr);
 
         sendto(sock, data.data(), data.size(), 0,
@@ -80,14 +80,14 @@ protected:
 TEST_F(UDPReceiverTest, ReceivesLargePacketCorrectly) {
     UDPReceiver receiver(loop);
     auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
-    ASSERT_TRUE(static_cast<bool>(result));
+    ASSERT_TRUE(result.has_value()) << "Subscribe failed: " << result.error().message();
 
     // Create a packet larger than the batch size (64) but smaller than buffer (2048)
     // If the bug exists (iov_len = batchSize), this packet will be truncated to 64 bytes.
     std::string largePayload(1000, 'A'); // 1000 bytes of 'A'
     std::vector<uint8_t> packetData(largePayload.begin(), largePayload.end());
 
-    sendUdpPacket(packetData);
+    sendUdpPacket(packetData, TEST_PORT);
 
     // Run loop briefly to process the packet
     loop.runOnce(100);
@@ -103,12 +103,12 @@ TEST_F(UDPReceiverTest, HandlesBurstOfPackets) {
     config.batchSize = 10; // Configure small batch for testing
     UDPReceiver receiver(loop, config);
     auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
-    ASSERT_TRUE(static_cast<bool>(result));
+    ASSERT_TRUE(result.has_value());
 
     int packetCount = 5;
     for(int i=0; i < packetCount; ++i) {
         std::string msg = "Packet " + std::to_string(i);
-        sendUdpPacket({msg.begin(), msg.end()});
+        sendUdpPacket({msg.begin(), msg.end()}, TEST_PORT);
     }
 
     // Allow time for OS to buffer and loop to read
@@ -118,13 +118,45 @@ TEST_F(UDPReceiverTest, HandlesBurstOfPackets) {
     EXPECT_EQ(handler.receivedPackets.size(), packetCount);
 }
 
+// New Test: Verify Error Handling for Duplicate Ports
+TEST_F(UDPReceiverTest, ReturnsErrorOnDuplicatePort) {
+    UDPReceiver receiver(loop);
+
+    // First one succeeds
+    auto res1 = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(res1.has_value());
+
+    // Second one should fail with EADDRINUSE
+    auto res2 = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_FALSE(res2.has_value());
+    EXPECT_EQ(res2.error().value(), EADDRINUSE);
+}
+
+// New Test: Verify Unsubscribe Result
+TEST_F(UDPReceiverTest, UnsubscribeWorksCorrectly) {
+    UDPReceiver receiver(loop);
+
+    // Subscribe to a dynamic port (0)
+    auto subRes = receiver.subscribe(0, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(subRes.has_value());
+    uint16_t actualPort = static_cast<uint16_t>(subRes.value());
+
+    // Unsubscribe and check Result<void>
+    auto unsubRes = receiver.unsubscribe(actualPort);
+    EXPECT_TRUE(unsubRes.has_value()) << "Unsubscribe failed: " << unsubRes.error().message();
+
+    // Verify it's actually gone
+    auto unsubRes2 = receiver.unsubscribe(actualPort);
+    EXPECT_FALSE(unsubRes2.has_value());
+    EXPECT_EQ(unsubRes2.error().value(), ENOENT);
+}
+
 // 3. Verify Lifecycle Safety (No crashes on scope exit)
 TEST_F(UDPReceiverTest, SafeDestruction) {
     {
         UDPReceiver receiver(loop);
         auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
-        ASSERT_TRUE(static_cast<bool>(result));
-        // Receiver goes out of scope here
+        ASSERT_TRUE(result.has_value());
     }
 
     // The loop should be clean. If the destructor didn't remove the source,

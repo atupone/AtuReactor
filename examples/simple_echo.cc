@@ -48,7 +48,9 @@ int main() {
 
         // Run the reactor loop
         while (true) {
-            loop.runOnce(1000); // 1 second timeout
+            // Use .value() here because if the loop fails (e.g., EBADF),
+            // the server cannot recover and should exit.
+            loop.runOnce(1000).value(); // 1 second timeout
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

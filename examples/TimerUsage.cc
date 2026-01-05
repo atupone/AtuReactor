@@ -21,28 +21,39 @@ int main() {
 
     // Example 1: Periodic Heartbeat (every 1 second)
     int counter = 0;
-    loop.runEvery(std::chrono::seconds(1), [&counter]() {
+    auto res1 = loop.runEvery(std::chrono::seconds(1), [&counter]() {
         counter++;
         std::cout << "[Periodic] Heartbeat " << counter << "s elapsed" << std::endl;
     });
+    if (!res1) {
+        std::cerr << "Failed to schedule periodic timer" << std::endl;
+    }
 
     // Example 2: One-shot delayed task (triggers once after 3.5 seconds)
-    loop.runAfter(std::chrono::milliseconds(3500), []() {
+    auto res2 = loop.runAfter(std::chrono::milliseconds(3500), []() {
         std::cout << "[One-Shot] 3.5 seconds have passed. Cleaning up resources..." << std::endl;
     });
+    if (!res2) {
+        std::cerr << "Failed to schedule one-shot timer" << std::endl;
+    }
 
     // Example 3: Self-canceling logic
     // We schedule a task for 10s, but we will exit the loop before it fires
-    loop.runAfter(std::chrono::seconds(10), []() {
+    auto res3 = loop.runAfter(std::chrono::seconds(10), []() {
         std::cout << "This should never print!" << std::endl;
     });
+    if (!res3) {
+        std::cerr << "Failed to schedule 10s timer: " << res3.error().message() << std::endl;
+    }
 
     // Run the loop for 5 seconds total
     auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-        loop.runOnce(100); // Poll with 100ms timeout
+        // Use .value() to ensure the loop hasn't encountered a system error.
+        // If epoll_wait fails, this will throw/abort with the system error message.
+        loop.runOnce(100).value(); // Poll with 100ms timeout
     }
 
-    std::cout << "Example finished." << std::endl;
+    std::cout << "Example finished. The 10s timer was safely discarded." << std::endl;
     return 0;
 }

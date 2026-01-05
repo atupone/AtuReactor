@@ -48,9 +48,11 @@ int main() {
             std::cerr << "Stream B failed: " << resB.error().message() << std::endl;
         }
 
-        std::cout << "Monitoring multiple generic streams..." << std::endl;
         if (resA || resB) {
-            while (true) loop.runOnce(-1);
+            std::cout << "Monitoring multiple generic streams..." << std::endl;
+            while (true) {
+                loop.runOnce(-1).value();
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

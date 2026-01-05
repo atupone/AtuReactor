@@ -72,23 +72,28 @@ UDPReceiver::~UDPReceiver() {
 }
 
 Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn handler) {
-    if (handler == nullptr) return {std::error_code(EINVAL, std::system_category())};
+    if (handler == nullptr) {
+        return std::error_code(EINVAL, std::system_category());
+    }
 
-    if (m_port_to_fd_map.count(port))
-        return {std::error_code(EADDRINUSE, std::system_category())};
+    if (m_port_to_fd_map.find(port) != m_port_to_fd_map.end()) {
+        return std::error_code(EADDRINUSE, std::system_category());
+    }
 
     if (m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
         return {std::error_code(EMFILE, std::system_category())};
     }
 
-    // Initialize IPv4 UDP socket
+    // Initialize IPv4 UDP socket with RAII ScopedFd
     ScopedFd udp_socket(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    if (udp_socket < 0) return {std::error_code(errno, std::system_category())};
+    if (udp_socket < 0) {
+        return std::error_code(errno, std::system_category());
+    }
 
     // Reuse Address: Allows immediate restart of the application
     int optval = 1;
     if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        return {std::error_code(errno, std::system_category())};
+        return std::error_code(errno, std::system_category());
     }
 
     struct sockaddr_in addr{};
@@ -97,41 +102,60 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     addr.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
 
     if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == -1) {
-        return {std::error_code(errno, std::system_category())};
+        return std::error_code(errno, std::system_category());
     }
 
     // Resolve the actual port (Crucial for port 0)
     struct sockaddr_in sin;
     socklen_t len = sizeof(sin);
     if (getsockname(udp_socket, (struct sockaddr *)&sin, &len) == -1) {
-        return {std::error_code(errno, std::system_category())};
+        return std::error_code(errno, std::system_category());
     }
     uint16_t localPort = ntohs(sin.sin_port);
 
     // Register with the EventLoop
     int raw_fd = udp_socket;
-    m_loop.addSource(raw_fd, EPOLLIN, UDPReceiverTag{
+    auto regResult = m_loop.addSource(raw_fd, EPOLLIN, UDPReceiverTag{
         this,
         raw_fd,
         context,
         handler
     });
 
-    // Move ownership of ScopedFd to our map
+    if (!regResult) {
+        // If epoll registration fails, ScopedFd will automatically close the socket
+        // when we return the error here.
+        return regResult.error();
+    }
+
+    // Move ownership of ScopedFd to our map only after success
     m_port_to_fd_map.emplace(localPort, std::move(udp_socket));
 
     return {static_cast<int>(localPort)};
 }
 
-void UDPReceiver::unsubscribe(int localPort) {
-    auto it = m_port_to_fd_map.find(localPort);
-    if (it != m_port_to_fd_map.end()) {
-        // Remove from epoll first to stop callbacks
-        m_loop.removeSource(it->second.fd);
+Result<void> UDPReceiver::unsubscribe(uint16_t port) {
+    // Find the port in our map
+    auto it = m_port_to_fd_map.find(port);
 
-        // Erasing from map triggers ScopedFd destructor, closing the socket
-        m_port_to_fd_map.erase(it);
+    // If it doesn't exist, return an error instead of silently doing nothing
+    if (it == m_port_to_fd_map.end()) {
+        return std::error_code(ENOENT, std::system_category());
     }
+
+    // Get the raw FD to remove it from the EventLoop
+    int fd = it->second;
+
+    // Remove from EventLoop (Internal epoll_ctl DEL)
+    auto loopRes = m_loop.removeSource(fd);
+
+    // Remove from our map
+    // Because m_port_to_fd_map stores ScopedFd, the destructor
+    // of ScopedFd will automatically call ::close(fd) here.
+    m_port_to_fd_map.erase(it);
+
+    // Return the loop result (or success if we don't care about epoll_ctl DEL errors)
+    return loopRes;
 }
 
 // NOTE: handleRead assumes exclusive access to m_flatBuffer.

@@ -29,6 +29,7 @@
 
 // Library headers
 #include <atu_reactor/ScopedFd.h>
+#include <atu_reactor/Result.h>
 
 namespace atu_reactor {
 
@@ -88,36 +89,36 @@ class EventLoop {
          * @param cb The function to execute when the event triggers.
          * @throws std::runtime_error if the OS fails to add the source.
          */
-        void addSource(int fd, uint32_t eventMask, InternalHandler handler);
+        Result<void> addSource(int fd, uint32_t eventMask, InternalHandler handler);
 
         /**
          * @brief Removes a file descriptor and its callback from the loop.
          * @param fd The descriptor to stop monitoring.
          */
-        void removeSource(int fd);
+        Result<void> removeSource(int fd);
 
         /**
          * @brief Waits for and dispatches pending events.
          * @param timeoutMs Max time to wait. -1 = infinite, 0 = non-blocking poll.
          */
-        void runOnce(int timeoutMs);
+        Result<void> runOnce(int timeoutMs);
 
         /**
          * @brief Run a callback once after a delay.
          * @return Unique ID to allow cancellation.
          */
-        TimerId runAfter(Duration delay, TimerCallback cb);
+        Result<TimerId> runAfter(Duration delay, TimerCallback cb);
 
         /**
          * @brief Run a callback periodically.
          * @return Unique ID to allow cancellation.
          */
-        TimerId runEvery(Duration interval, TimerCallback cb);
+        Result<TimerId> runEvery(Duration interval, TimerCallback cb);
 
         /**
          * @brief Cancel a specific timer if it hasn't run yet.
          */
-        void cancelTimer(TimerId id);
+        Result<void> cancelTimer(TimerId id);
 
         // Prevent copying a reactor instance
         EventLoop(const EventLoop&) = delete;

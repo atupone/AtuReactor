@@ -74,7 +74,7 @@ class UDPReceiver {
          * @brief Closes the socket for a port and removes it from the EventLoop.
          * @param localPort The port to stop listening on.
          */
-        void unsubscribe(int localPort);
+        Result<void> unsubscribe(uint16_t localPort);
 
         // Disable copy/move to strictly manage resource identity
         UDPReceiver(const UDPReceiver&) = delete;

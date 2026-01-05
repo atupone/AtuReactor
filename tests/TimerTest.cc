@@ -22,6 +22,7 @@
 #include <atomic>
 
 using namespace atu_reactor;
+using namespace std::chrono_literals;
 
 class TimerTest : public ::testing::Test {
 protected:
@@ -34,9 +35,10 @@ TEST_F(TimerTest, OneShotExecutesAfterDelay) {
     auto start = std::chrono::steady_clock::now();
 
     // Schedule for 100ms
-    loop.runAfter(std::chrono::milliseconds(100), [&]() {
+    auto res = loop.runAfter(std::chrono::milliseconds(100), [&]() {
         fired = true;
     });
+    ASSERT_TRUE(res.has_value()) << "runAfter failed: " << res.error().message();
 
     // Run once immediately: should not fire
     loop.runOnce(0);
@@ -75,11 +77,19 @@ TEST_F(TimerTest, PeriodicTimerRepeats) {
 TEST_F(TimerTest, CancelledTimerNeverFires) {
     bool fired = false;
 
-    TimerId id = loop.runAfter(std::chrono::milliseconds(50), [&]() {
+    // Capture the Result object
+    auto res = loop.runAfter(std::chrono::milliseconds(50), [&]() {
         fired = true;
     });
 
-    loop.cancelTimer(id);
+    // Verify success
+    ASSERT_TRUE(res.has_value()) << "runAfter failed: " << res.error().message();
+
+    // Unwrap the actual TimerId
+    TimerId id = res.value();
+
+    // Now you can cancel it
+    loop.cancelTimer(id).value();
 
     // Wait and run
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -93,15 +103,22 @@ TEST_F(TimerTest, CancelledTimerNeverFires) {
 TEST_F(TimerTest, OutOfOrderTimers) {
     std::vector<int> executionOrder;
 
-    loop.runAfter(std::chrono::milliseconds(200), [&]() { executionOrder.push_back(200); });
-    loop.runAfter(std::chrono::milliseconds(50),  [&]() { executionOrder.push_back(50);  });
-    loop.runAfter(std::chrono::milliseconds(100), [&]() { executionOrder.push_back(100); });
+    loop.runAfter(
+        std::chrono::milliseconds(200),
+        [&]() { executionOrder.push_back(200); }).value();
+    loop.runAfter(
+        std::chrono::milliseconds(50),
+        [&]() { executionOrder.push_back(50);  }).value();
+    loop.runAfter(
+        std::chrono::milliseconds(100),
+        [&]() { executionOrder.push_back(100); }).value();
 
     // Run until all 3 fire
     auto start = std::chrono::steady_clock::now();
     while (executionOrder.size() < 3 &&
            std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500)) {
-        loop.runOnce(10);
+        auto res = loop.runOnce(10);
+        ASSERT_TRUE(res.has_value()) << "Loop execution failed: " << res.error().message();
     }
 
     ASSERT_EQ(executionOrder.size(), 3);

@@ -50,7 +50,7 @@ EventLoop::EventLoop()
     m_sources.resize(MAX_FDS);
 
     // Register the timer FD into the epoll loop immediately
-    addSource(m_timer_fd, EPOLLIN, TimerTag{this});
+    addSource(m_timer_fd, EPOLLIN, TimerTag{this}).value();
 }
 
 /**
@@ -60,9 +60,15 @@ EventLoop::EventLoop()
  */
 EventLoop::~EventLoop() = default;
 
-void EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler handler) {
-    if (fd < 0 || fd >= static_cast<int>(m_sources.size()))
-        throw std::runtime_error("FD out of range");
+Result<void> EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler handler) {
+    if (fd < 0) {
+        return std::error_code(EBADF, std::generic_category());
+    }
+
+    // Dynamic resizing to prevent out-of-bounds crashes
+    if (static_cast<size_t>(fd) >= m_sources.size()) {
+        m_sources.resize(static_cast<size_t>(fd) + 1);
+    }
 
     // Store the callback in our local map
     m_sources[fd].handler = handler;
@@ -75,36 +81,51 @@ void EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler handler) {
 
     // Tell the kernel to start monitoring this FD
     if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        throw std::runtime_error("EventLoop: epoll_ctl ADD failed for FD " + std::to_string(fd));
+        // Return the system error code instead of throwing or ignoring
+        return std::error_code(errno, std::generic_category());
     }
+
+    // Return success
+    return Result<void>::success();
 }
 
-void EventLoop::removeSource(int fd) {
-    if (fd < 0 || fd >= static_cast<int>(m_sources.size()))
-        throw std::runtime_error("FD out of range");
+Result<void> EventLoop::removeSource(int fd) {
+    if (fd < 0 || fd >= static_cast<int>(m_sources.size())) {
+        return std::error_code(EBADF, std::system_category());
+    }
 
-    // Tell the kernel to stop monitoring this FD.
-    // Note: Some older kernels require non-null event even for DEL.
+    // Remove from epoll
+    // Note: We do this before clearing our internal vector.
+    // In Linux < 2.6.9, epoll_ctl(DEL) required a valid pointer to event,
+    // but modern kernels allow NULL.
     if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-        // We only report if the error isn't "Not Found" (which happens if already closed)
-        if (errno != ENOENT) {
-            perror("EventLoop: epoll_ctl DEL failed");
-        }
+        // If the FD wasn't registered, epoll_ctl returns ENOENT.
+        // We can choose to return this error or ignore it.
+        // Returning it is better for library debugging.
+        return std::error_code(errno, std::system_category());
     }
 
-    // Clean up local resources
-    m_sources[fd].handler = std::monostate{};
+    // Clear internal handler storage
+    // We check bounds to prevent a crash if a weird FD is passed
+    if (static_cast<size_t>(fd) < m_sources.size()) {
+        m_sources[static_cast<size_t>(fd)].handler = InternalHandler{};
+    }
+
+    return Result<void>::success();
 }
 
-void EventLoop::runOnce(int timeoutMs) {
+Result<void> EventLoop::runOnce(int timeoutMs) {
     // Block until at least one event occurs or the timeout expires
     int ready = epoll_wait(m_epoll_fd, m_impl->events.data(), MAX_EVENTS, timeoutMs);
 
     if (ready < 0) {
         // EINTR means a system signal (like Ctrl+C) woke us up; this is not a failure.
-        if (errno == EINTR) return;
-        perror("EventLoop: epoll_wait");
-        return;
+        if (errno == EINTR) {
+            return Result<void>::success();
+        }
+
+        // Return the actual system error wrapped in our Result type
+        return std::error_code(errno, std::system_category());
     }
 
     // Iterate only through the number of file descriptors that actually have events
@@ -126,32 +147,56 @@ void EventLoop::runOnce(int timeoutMs) {
             }
         }, source->handler);
     }
+
+    // Final success return to satisfy the Result<void> return type
+    return Result<void>::success();
 }
 
-TimerId EventLoop::runAfter(Duration delay, TimerCallback cb) {
-    Timestamp when = Clock::now() + delay;
-    Timer t{when, Duration(0), std::move(cb), m_nextTimerId++, false};
-    insertTimer(std::move(t));
-    return t.id;
-}
-
-TimerId EventLoop::runEvery(Duration interval, TimerCallback cb) {
-    Timestamp when = Clock::now() + interval;
-    Timer t{when, interval, std::move(cb), m_nextTimerId++, true};
-    insertTimer(std::move(t));
-    return t.id;
-}
-
-void EventLoop::cancelTimer(TimerId id) {
-    auto it = m_activeTimers.find(id);
-    if (it != m_activeTimers.end()) {
-        m_timers.erase(it->second); // Remove from the set
-        m_activeTimers.erase(it);   // Remove from the map
-
-        // If we removed the earliest timer, we must update the hardware timer
-        // to reflect the new earliest time.
-        resetTimerFd();
+Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
+    if (delay.count() < 0) {
+        return std::error_code(EINVAL, std::system_category());
     }
+
+    TimerId id = m_nextTimerId++;
+    Timestamp when = Clock::now() + delay;
+    Timer t{when, Duration(0), std::move(cb), id, false};
+
+    insertTimer(std::move(t));
+
+    // Return the id; it will be wrapped in Result<TimerId> automatically
+    return t.id;
+}
+
+Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
+    if (interval.count() <= 0) {
+        return std::error_code(EINVAL, std::system_category());
+    }
+
+    TimerId id = m_nextTimerId++;
+    Timestamp when = Clock::now() + interval;
+    Timer t{when, interval, std::move(cb), id, true};
+
+    insertTimer(std::move(t));
+
+    return id;
+}
+
+Result<void> EventLoop::cancelTimer(TimerId id) {
+    auto it = m_activeTimers.find(id);
+
+    if (it == m_activeTimers.end()) {
+        // Return an error if the TimerId was not found
+        return std::error_code(ENOENT, std::system_category());
+    }
+
+    m_timers.erase(it->second); // Remove from the set
+    m_activeTimers.erase(it);   // Remove from the map
+
+    // If we removed the earliest timer, we must update the hardware timer
+    // to reflect the new earliest time.
+    resetTimerFd();
+
+    return Result<void>::success();
 }
 
 void EventLoop::insertTimer(Timer t) {
