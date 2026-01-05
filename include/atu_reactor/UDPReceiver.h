@@ -105,6 +105,9 @@ class UDPReceiver {
          */
         std::vector<struct iovec> m_ioVectors;             // Points to packetBuffers
         std::vector<struct mmsghdr> m_msgHeaders;          // Kernel-to-user metadata
+
+        // Store source addresses for the entire batch to avoid stack allocation in handleRead
+        std::vector<struct sockaddr_storage> m_senderAddrs;
 };
 
 }  // namespace atu_reactor

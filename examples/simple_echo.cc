@@ -44,7 +44,7 @@ int main() {
                       << result.error().message() << std::endl;
         }
 
-        std::cout << "Starting Echo Server on port " << port << "..." << std::endl;
+        std::cout << "Starting Echo Server on port " << port << " (IPv4 and IPv6)..." << std::endl;
 
         // Run the reactor loop
         while (true) {

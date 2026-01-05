@@ -49,7 +49,7 @@ int main() {
         }
 
         if (resA || resB) {
-            std::cout << "Monitoring multiple generic streams..." << std::endl;
+            std::cout << "Monitoring streams on IPv4/IPv6 dual-stack." << std::endl;
             while (true) {
                 loop.runOnce(-1).value();
             }

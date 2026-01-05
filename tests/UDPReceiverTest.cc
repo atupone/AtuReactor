@@ -72,6 +72,24 @@ protected:
                (struct sockaddr*)&destAddr, sizeof(destAddr));
         close(sock);
     }
+
+    // Helper to send raw IPv6 UDP packets
+    void sendUdp6Packet(const std::vector<uint8_t>& data, uint16_t port) {
+        int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            if (errno == EAFNOSUPPORT) return; // Skip if IPv6 not supported on host
+            ASSERT_GE(sock, 0);
+        }
+
+        struct sockaddr_in6 destAddr{};
+        destAddr.sin6_family = AF_INET6;
+        destAddr.sin6_port = htons(port);
+        inet_pton(AF_INET6, "::1", &destAddr.sin6_addr);
+
+        sendto(sock, data.data(), data.size(), 0,
+                (struct sockaddr*)&destAddr, sizeof(destAddr));
+        close(sock);
+    }
 };
 
 // --- Test Cases ---
@@ -164,3 +182,51 @@ TEST_F(UDPReceiverTest, SafeDestruction) {
     loop.runOnce(10);
     SUCCEED(); // If we reached here without segfault, pass.
 }
+
+// Verify that the receiver can handle IPv6 packets
+TEST_F(UDPReceiverTest, ReceivesIPv6Packet) {
+    UDPReceiver receiver(loop);
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    std::vector<uint8_t> packetData = {0xDE, 0xAD, 0xBE, 0xEF};
+    sendUdp6Packet(packetData, TEST_PORT);
+
+    loop.runOnce(100);
+
+    ASSERT_EQ(handler.receivedPackets.size(), 1);
+    EXPECT_EQ(handler.receivedPackets[0].data, packetData);
+}
+
+// Verify Dual-Stack: One port receiving from both v4 and v6
+TEST_F(UDPReceiverTest, HandlesMixedIPv4AndIPv6Traffic) {
+    UDPReceiver receiver(loop);
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    sendUdpPacket({0x04}, TEST_PORT); // Send v4
+    sendUdp6Packet({0x06}, TEST_PORT); // Send v6
+
+    loop.runOnce(100);
+
+    // Expecting 2 packets on the same handler/port
+    ASSERT_EQ(handler.receivedPackets.size(), 2);
+}
+
+// Verify dynamic port resolution works with the new sockaddr_storage logic
+TEST_F(UDPReceiverTest, IPv6DynamicPortResolution) {
+    UDPReceiver receiver(loop);
+    // Subscribe to port 0 (OS chooses the port)
+    auto result = receiver.subscribe(0, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    uint16_t assignedPort = static_cast<uint16_t>(result.value());
+    EXPECT_GT(assignedPort, 0);
+
+    // Verify we can actually receive on that assigned port via IPv6
+    sendUdp6Packet({0xAA}, assignedPort);
+    loop.runOnce(100);
+
+    ASSERT_EQ(handler.receivedPackets.size(), 1);
+}
+

@@ -33,7 +33,8 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
         m_ownerThreadId(std::this_thread::get_id()),
         // Allocate ONE big chunk of memory for all packets
         m_ioVectors(config.batchSize),
-        m_msgHeaders(config.batchSize)
+        m_msgHeaders(config.batchSize),
+        m_senderAddrs(config.batchSize)
 {
     m_alignedBufferSize = (m_config.bufferSize + 63) & ~63; // Round up to multiple of 64
 
@@ -56,6 +57,11 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
         m_ioVectors[i].iov_base = packetStart;
         m_ioVectors[i].iov_len = m_config.bufferSize;
 
+        std::memset(&m_msgHeaders[i], 0, sizeof(struct mmsghdr));
+
+        // Protocol-agnostic address setup: done ONCE here
+        m_msgHeaders[i].msg_hdr.msg_name = &m_senderAddrs[i];
+
         // Link the message header to the iovec
         memset(&m_msgHeaders[i], 0, sizeof(struct mmsghdr));
         m_msgHeaders[i].msg_hdr.msg_iov = &m_ioVectors[i];
@@ -76,19 +82,32 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         return std::error_code(EINVAL, std::system_category());
     }
 
+    // Use the OS limit check only if you explicitly want to cap this instance
+    if (m_config.maxFds > 0 && m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
+        return std::error_code(EMFILE, std::system_category());
+    }
+
     if (m_port_to_fd_map.find(port) != m_port_to_fd_map.end()) {
         return std::error_code(EADDRINUSE, std::system_category());
     }
 
-    if (m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
-        return {std::error_code(EMFILE, std::system_category())};
+    // Attempt IPv6 Dual-Stack Socket
+    int raw_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    bool isV6 = true;
+
+    if (raw_fd < 0 && errno == EAFNOSUPPORT) {
+        // Fallback to IPv4 if IPv6 is disabled in the kernel
+        isV6 = false;
+        raw_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     }
 
-    // Initialize IPv4 UDP socket with RAII ScopedFd
-    ScopedFd udp_socket(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    if (udp_socket < 0) {
+    if (raw_fd < 0) {
+        // Here the OS will naturally return EMFILE if the real limit is hit
         return std::error_code(errno, std::system_category());
     }
+
+    // Immediately wrap in your ScopedFd for RAII safety
+    ScopedFd udp_socket(raw_fd);
 
     // Reuse Address: Allows immediate restart of the application
     int optval = 1;
@@ -96,28 +115,44 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         return std::error_code(errno, std::system_category());
     }
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
+    if (isV6) {
+        // Allow IPv4 packets on this IPv6 socket
+        int off = 0;
+        setsockopt(udp_socket, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
-    if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == -1) {
-        return std::error_code(errno, std::system_category());
+        struct sockaddr_in6 addr6{};
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(port);
+        addr6.sin6_addr = in6addr_any;
+
+        if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr6), sizeof(addr6)) == -1) {
+            return std::error_code(errno, std::system_category());
+        }
+    } else {
+        struct sockaddr_in addr4{};
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        addr4.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
+
+        if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr4), sizeof(addr4)) == -1) {
+            return std::error_code(errno, std::system_category());
+        }
     }
 
     // Resolve the actual port (Crucial for port 0)
-    struct sockaddr_in sin;
-    socklen_t len = sizeof(sin);
-    if (getsockname(udp_socket, (struct sockaddr *)&sin, &len) == -1) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
         return std::error_code(errno, std::system_category());
     }
-    uint16_t localPort = ntohs(sin.sin_port);
+    uint16_t localPort = (ss.ss_family == AF_INET6)
+        ? ntohs(reinterpret_cast<struct sockaddr_in6*>(&ss)->sin6_port)
+        : ntohs(reinterpret_cast<struct sockaddr_in*>(&ss)->sin_port);
 
     // Register with the EventLoop
-    int raw_fd = udp_socket;
-    auto regResult = m_loop.addSource(raw_fd, EPOLLIN, UDPReceiverTag{
+    auto regResult = m_loop.addSource(udp_socket, EPOLLIN, UDPReceiverTag{
         this,
-        raw_fd,
+        (int)udp_socket,
         context,
         handler
     });
@@ -164,6 +199,13 @@ Result<void> UDPReceiver::unsubscribe(uint16_t port) {
 void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
     assert(std::this_thread::get_id() == m_ownerThreadId && 
             "UDPReceiver handled on wrong thread!");
+
+    // 1. Reset the lengths BEFORE the system call.
+    // This ensures the kernel can write the full address for every packet slot.
+    for (auto& header : m_msgHeaders) {
+        header.msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+    }
+
     // recvmmsg allows us to grab up to BATCH_SIZE packets in one go.
     // MSG_DONTWAIT ensures we don't block if the buffer was emptied by a race condition.
     int numPackets = recvmmsg(
