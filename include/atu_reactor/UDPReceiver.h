@@ -27,6 +27,7 @@
 #include <atu_reactor/EventLoop.h>
 #include <atu_reactor/Result.h>
 #include <atu_reactor/ScopedFd.h>
+#include <atu_reactor/Types.h>
 
 namespace atu_reactor {
 
@@ -38,6 +39,9 @@ struct ReceiverConfig {
     int batchSize = 64;       // Number of packets to pull via recvmmsg
     int bufferSize = 2048;    // Sufficient for standard MTU + headers
 };
+
+// Define the function pointer type here
+
 
 /**
  * @class UDPReceiver

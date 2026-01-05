@@ -9,6 +9,7 @@
 * **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with $O(1)$ scalability.
 * **Batch UDP Reception**: Utilizes `recvmmsg` to pull multiple packets from the kernel in a single system call.
 * **Dual-Stack IPv6 Support**: Automatically handles both IPv4 and IPv6 traffic on the same port using a single subscription.
+* **Safety & Robustness**: Reports kernel-level events like packet truncation via a status bitmask.
 * **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to improve cache locality.
 * **Resource Safety**: Full RAII implementation using `ScopedFd` to ensure descriptors are never leaked.
 * **Precision Timers**: Native support for high-resolution timers via Linux `timerfd`.
@@ -18,19 +19,24 @@
 ## 💻 Quick Start
 
 ### 1. Define a Callback
-AtuReactor uses a C-style function pointer for packet handling to minimize abstraction overhead.
+AtuReactor uses a C-style function pointer for packet handling to minimize abstraction overhead. The callback receives a `status` bitmask to check for errors like truncation.
 
 ```cpp
-#include <atu_reactor/UDPReceiver.h>
 #include <iostream>
+#include <atu_reactor/UDPReceiver.h>
+#include <atu_reactor/Types.h>
 
-// Callback signature: void(*)(void* context, const uint8_t* data, size_t len)
-void onPacketReceived(void* context, const uint8_t* data, size_t size) {
+// Callback signature: void(*)(void* context, const uint8_t* data, size_t len, uint32_t status)
+void onPacketReceived(void* context, const uint8_t* data, size_t size, uint32_t status) {
+    if (status & atu_reactor::PacketStatus::TRUNCATED) {
+        std::cerr << "[Warning] Packet truncated by kernel!" << std::endl;
+    }
     std::cout << "Received " << size << " bytes" << std::endl;
 }
 ```
+
 ### 2. Run the Event Loop
-Register your handler. The `subscribe` method now supports Dual-Stack, meaning it listens on both IPv4 (`0.0.0.0`) and IPv6 (`::`) by default.
+Register your handler. The `subscribe` method supports Dual-Stack, meaning it listens on both IPv4 and IPv6 simultaneously.
 
 ```cpp
 #include <atu_reactor/EventLoop.h>
@@ -40,89 +46,104 @@ int main() {
     atu_reactor::EventLoop loop;
     atu_reactor::UDPReceiver receiver(loop);
 
-    // Subscribe to port 8080. Returns Result<int>
-    // This will accept traffic from both IPv4 (127.0.0.1) and IPv6 (::1)
-    auto result = receiver.subscribe(8080, nullptr, onPacketReceived);
+    // Register handler for UDP port 12345
+    auto result = receiver.subscribe(12345, nullptr, onPacketReceived);
     
-    if (!result) {
-        std::cerr << "Error: " << result.error().message() << std::endl;
-        return 1;
+    if (result) {
+        while (true) {
+            loop.runOnce(1000); // Poll with 1s timeout
+        }
     }
-
-    while (true) {
-        loop.runOnce(-1);
-    }
-
     return 0;
 }
 ```
-### 3. Using Timers
-The reactor supports scheduling tasks directly within the event loop without managing separate threads. All timers are managed using Linux `timerfd` for high precision.
 
+---
+
+## 🛡️ Robustness & Packet Integrity
+
+AtuReactor is designed for mission-critical data. Starting with version **0.0.5**, the library provides kernel-level feedback for every packet via a status bitmask.
+
+### Handling Truncation
+If a physical UDP packet exceeds your configured `bufferSize`, the Linux kernel discards the overflowing bytes. AtuReactor captures the `MSG_TRUNC` flag and passes it to your callback as `PacketStatus::TRUNCATED`.
+
+
+
+**Usage:**
 ```cpp
-// Run a callback once after a 500ms delay
-loop.runAfter(std::chrono::milliseconds(500), []() {
-    std::cout << "One-shot timer expired" << std::endl;
-});
+#include <atu_reactor/Types.h>
 
-// Run a callback periodically every 1 second
+void onPacket(void* context, const uint8_t* data, size_t len, uint32_t status) {
+    if (status & atu_reactor::PacketStatus::TRUNCATED) {
+        std::cerr << "Received incomplete data (" << len << " bytes received)" << std::endl;
+        return; 
+    }
+    process(data, len);
+}
+```
+
+---
+
+## ⏱️ Precision Timers
+
+AtuReactor provides high-resolution timers using the Linux `timerfd` API, ensuring that timer expirations are handled with the same efficiency as network I/O.
+
+
+
+### Periodic and One-Shot Timers
+```cpp
+atu_reactor::EventLoop loop;
+
+// Example 1: Periodic Heartbeat (every 1 second)
 loop.runEvery(std::chrono::seconds(1), []() {
-    std::cout << "Periodic heartbeat" << std::endl;
+    std::cout << "Heartbeat pulse..." << std::endl;
+});
+
+// Example 2: One-shot delayed task (triggers once after 500ms)
+loop.runAfter(std::chrono::milliseconds(500), []() {
+    std::cout << "Delayed task executed." << std::endl;
 });
 ```
 
----
-
-## 🧪 Testing Dual-Stack
-You can verify the dual-stack functionality using standard Linux tools:
-
-```bash
-# Send a packet via IPv4
-echo "test" | nc -u 127.0.0.1 8080
-
-# Send a packet via IPv6
-echo "test" | nc -u ::1 8080
+### Timer Cancellation
+Every timer registration returns a `TimerId` which can be used to cancel the timer before it fires.
+```cpp
+auto res = loop.runAfter(std::chrono::seconds(10), []() { /* ... */ });
+if (res) {
+    atu_reactor::TimerId id = res.value();
+    loop.cancelTimer(id); // Timer will no longer fire
+}
 ```
 
 ---
 
-## ⚠️ Threading Model
+## ⚡ Performance & Threading
 
-**AtuReactor is Thread-Hostile by design**.
+To achieve maximum deterministic performance, AtuReactor follows a **single-threaded execution model**:
 
-To achieve maximum performance, the library avoids internal locking and utilizes shared memory structures.
-
-* **Single-Threaded Execution**: All interactions with an `EventLoop` or `UDPReceiver` instance must occur on the same thread that constructed the object.
-* **Safety Checks**: Debug builds use `assert` statements to prevent cross-thread access.
+* **No Internal Locking**: Eliminates mutex contention overhead.
+* **Thread Affinity**: Recommended to pin the `EventLoop` thread to a specific CPU core.
+* **Thread Safety**: All methods must be called from the same thread that constructed the object.
 * **Scalability**: For multi-core utilization, instantiate one `EventLoop` and one `UDPReceiver` per thread.
-
-> **Note**: Sharing a `UDPReceiver` across multiple `EventLoop` instances will cause immediate data corruption in the packet buffers.
-
----
-
-
 
 ---
 
 ## ⚙️ Building and Installing
-
-To build the library, ensure you have **CMake 3.10+** and a **C++17** compatible compiler (like GCC 8+ or Clang 7+) installed on a Linux system.
 
 ```bash
 # 1. Clone the repository
 git clone [https://github.com/your-repo/AtuReactor.git](https://github.com/your-repo/AtuReactor.git)
 cd AtuReactor
 
-# 2. Create a build directory
+# 2. Build
 mkdir build && cd build
-
-# 3. Configure and build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 4. Install headers and library (optional)
+# 3. Install (optional)
 sudo make install
 ```
+
 ---
 
 ## ⚖️ License
@@ -130,8 +151,3 @@ sudo make install
 **AtuReactor** is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License** as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 This program is distributed in the hope that it will be useful, but **WITHOUT ANY WARRANTY**; without even the implied warranty of **MERCHANTABILITY** or **FITNESS FOR A PARTICULAR PURPOSE**. See the [GNU General Public License](https://www.gnu.org/licenses/) for more details.
-
-Copyright (C) 2026 Alfredo Tupone.
-
----
-

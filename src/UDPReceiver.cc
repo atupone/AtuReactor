@@ -22,6 +22,7 @@
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
+#include <iostream>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 
@@ -219,12 +220,19 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
 
     // Iterate through only the number of packets actually received
     for (int k = 0; k < numPackets; ++k) {
+        uint32_t status = PacketStatus::OK;
+
+        // Check if the MSG_TRUNC flag was set by the kernel
+        if (m_msgHeaders[k].msg_hdr.msg_flags & MSG_TRUNC) {
+            status |= PacketStatus::TRUNCATED;
+        }
+
         size_t len = m_msgHeaders[k].msg_len;
         if (len > 0) {
             // Data is at the specific offset in the flat buffer
             uint8_t* packetData = basePtr + (k * m_alignedBufferSize);
             // Dispatch the packet to the user-defined handler
-            handler(context, packetData, len);
+            handler(context, packetData, len, status);
         }
     }
 }

@@ -19,13 +19,17 @@ class GenericHandler {
 public:
     explicit GenericHandler(std::string label) : m_label(std::move(label)) {}
 
-    void process(const uint8_t*, size_t size) {
-        std::cout << "[Channel: " << m_label << "] Received " << size << " bytes." << std::endl;
+    void process(const uint8_t*, size_t size, uint32_t status) {
+        std::cout << "[Channel: " << m_label << "] Received " << size << " bytes.";
+        if (status & PacketStatus::TRUNCATED) {
+            std::cout << " (TRUNCATED)";
+        }
+        std::cout << std::endl;
     }
 
     // Static bridge function
-    static void bridge(void* context, const uint8_t* data, size_t len) {
-        static_cast<GenericHandler*>(context)->process(data, len);
+    static void bridge(void* context, const uint8_t* data, size_t len, uint32_t status) {
+        static_cast<GenericHandler*>(context)->process(data, len, status);
     }
 };
 

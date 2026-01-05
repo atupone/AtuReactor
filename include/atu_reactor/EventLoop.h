@@ -30,10 +30,9 @@
 // Library headers
 #include <atu_reactor/ScopedFd.h>
 #include <atu_reactor/Result.h>
+#include <atu_reactor/Types.h>
 
 namespace atu_reactor {
-
-using PacketHandlerFn = void(*)(void* context, const uint8_t* data, size_t len);
 
 // Forward declaration
 class EventLoop;

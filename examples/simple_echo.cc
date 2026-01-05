@@ -17,14 +17,17 @@ using namespace atu_reactor;
 // A simple handler that just prints packet info
 class EchoHandler {
 public:
-    void onData(const uint8_t*, size_t size) {
+    void onData(const uint8_t*, size_t size, uint32_t status) {
+        if (status & PacketStatus::TRUNCATED) {
+            std::cerr << "[Warning] Packet truncated!" << std::endl;
+        }
         std::cout << "Received " << size << " bytes" << std::endl;
         // You could process data here
     }
 
     // THE BRIDGE: Matches PacketHandlerFn signature
-    static void onPacketReceived(void* context, const uint8_t* data, size_t len) {
-        static_cast<EchoHandler*>(context)->onData(data, len);
+    static void onPacketReceived(void* context, const uint8_t* data, size_t len, uint32_t status) {
+        static_cast<EchoHandler*>(context)->onData(data, len, status);
     }
 };
 

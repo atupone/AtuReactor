@@ -35,17 +35,22 @@ public:
     struct ReceivedPacket {
         std::vector<uint8_t> data;
         size_t size;
+        uint32_t status;
     };
 
     std::vector<ReceivedPacket> receivedPackets;
 
-    void handlePacket(const uint8_t data[], size_t size) {
-        receivedPackets.push_back({std::vector<uint8_t>(data, data + size), size});
+    void handlePacket(const uint8_t data[], size_t size, uint32_t status) {
+        receivedPackets.push_back({
+            std::vector<uint8_t>(data, data + size),
+            size,
+            status
+        });
     }
 
     // Static bridge function required by the new UDPReceiver API
-    static void onPacket(void* context, const uint8_t* data, size_t len) {
-        static_cast<MockPacketHandler*>(context)->handlePacket(data, len);
+    static void onPacket(void* context, const uint8_t* data, size_t len, uint32_t status) {
+        static_cast<MockPacketHandler*>(context)->handlePacket(data, len, status);
     }
 
     void clear() { receivedPackets.clear(); }
@@ -230,3 +235,45 @@ TEST_F(UDPReceiverTest, IPv6DynamicPortResolution) {
     ASSERT_EQ(handler.receivedPackets.size(), 1);
 }
 
+// --- Truncation Specific Test Cases ---
+
+/**
+ * @brief Verify that packets larger than the internal buffer are flagged as TRUNCATED.
+ */
+TEST_F(UDPReceiverTest, DetectsTruncatedPackets) {
+    ReceiverConfig config;
+    config.bufferSize = 100; // Small buffer to force truncation
+    UDPReceiver receiver(loop, config);
+
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    // Send 150 bytes into a 100-byte buffer
+    std::vector<uint8_t> largePacket(150, 'X');
+    sendUdpPacket(largePacket, TEST_PORT);
+
+    loop.runOnce(100);
+
+    ASSERT_EQ(handler.receivedPackets.size(), 1);
+
+    // The received size should be capped at bufferSize (100)
+    EXPECT_EQ(handler.receivedPackets[0].size, 100);
+
+    // The TRUNCATED bit should be set in the status
+    EXPECT_TRUE(handler.receivedPackets[0].status & PacketStatus::TRUNCATED);
+}
+
+/**
+ * @brief Verify that normal-sized packets are marked with PacketStatus::OK.
+ */
+TEST_F(UDPReceiverTest, NormalPacketsHaveOkStatus) {
+    UDPReceiver receiver(loop);
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    sendUdpPacket({0x01, 0x02, 0x03}, TEST_PORT);
+    loop.runOnce(100);
+
+    ASSERT_EQ(handler.receivedPackets.size(), 1);
+    EXPECT_EQ(handler.receivedPackets[0].status, PacketStatus::OK);
+}
