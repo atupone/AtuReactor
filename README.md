@@ -8,11 +8,53 @@
 
 * **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with $O(1)$ scalability.
 * **Batch UDP Reception**: Utilizes `recvmmsg` to pull multiple packets from the kernel in a single system call.
+* **Hugepage Support**: Supports `MAP_HUGETLB` to reduce TLB misses and improve deterministic performance under high load.
 * **Dual-Stack IPv6 Support**: Automatically handles both IPv4 and IPv6 traffic on the same port using a single subscription.
-* **Safety & Robustness**: Reports kernel-level events like packet truncation via a status bitmask.
-* **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to improve cache locality.
+* **Safety & Robustness**: Reports kernel-level events like packet truncation (`MSG_TRUNC`) via a status bitmask.
+* **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to match CPU cache lines.
 * **Resource Safety**: Full RAII implementation using `ScopedFd` to ensure descriptors are never leaked.
 * **Precision Timers**: Native support for high-resolution timers via Linux `timerfd`.
+
+---
+
+## ⚡ Advanced Optimization: Hugepages (`MAP_HUGETLB`)
+
+AtuReactor supports **Hugepages** for its internal packet buffers. By using 2MB pages instead of the standard 4KB pages, the CPU's Translation Lookaside Buffer (TLB) can cover a much larger memory area with fewer entries. This significantly reduces "TLB Misses" and jitter during high-throughput packet bursts.
+
+
+
+### 1. Enable Hugepages in the Linux Kernel
+Hugepages must be pre-allocated by the operating system because they require contiguous physical memory that cannot be swapped out.
+
+**Check current status:**
+```bash
+grep Huge /proc/meminfo
+```
+*Look for `HugePages_Total` (usually 0) and `Hugepagesize` (usually 2048 kB).*
+
+**Reserve 512 pages (1GB of RAM for 2MB pages):**
+```bash
+# Temporary (lost after reboot)
+sudo sysctl -w vm.nr_hugepages=512
+
+# Permanent
+echo "vm.nr_hugepages = 512" | sudo tee -a /etc/sysctl.conf
+```
+
+### 2. How it works in AtuReactor
+When `UDPReceiver` is initialized, it calculates the required memory for your `batchSize` and `bufferSize` and attempts to map it using the `MAP_HUGETLB` flag.
+
+
+
+* **Success**: The packet buffer is backed by 2MB physical pages.
+* **Fallback**: If no hugepages are reserved in the kernel or the allocation fails, the library will automatically fall back to standard 4KB pages via a regular `mmap` call, ensuring the application remains functional.
+
+### 3. Verification
+You can verify if AtuReactor is successfully using the reserved pages while the application is running by watching the free page count:
+```bash
+watch -n1 "grep HugePages_Free /proc/meminfo"
+```
+If the number of free pages drops when your application starts and returns when it stops, Hugepage integration is active.
 
 ---
 

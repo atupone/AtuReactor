@@ -25,6 +25,7 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 
 namespace atu_reactor {
 
@@ -37,35 +38,61 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
         m_msgHeaders(config.batchSize),
         m_senderAddrs(config.batchSize)
 {
+    // Calculate size and alignment
+    // Round up the buffer size to a multiple of 64 for cache-line alignment
     m_alignedBufferSize = (m_config.bufferSize + 63) & ~63; // Round up to multiple of 64
 
-    // 2. Resize the buffer
-    // We add an extra 64 bytes of padding at the start to allow manual alignment
-    // if the vector doesn't start on a 64-byte boundary.
-    m_flatBuffer.resize((config.batchSize * m_alignedBufferSize) + 64);
+    // Total memory needed for all packets
+    size_t totalRequested = config.batchSize * m_alignedBufferSize;
 
-    // 3. Find the first 64-byte aligned address in our vector
-    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(m_flatBuffer.data());
-    uintptr_t alignedAddr = (rawAddr + 63) & ~63;
-    uint8_t* basePtr = reinterpret_cast<uint8_t*>(alignedAddr);
-    m_cachedBasePtr = reinterpret_cast<uint8_t*>(alignedAddr);
+    // Hugepages are typically 2MB. We round up the total mapping size to a 2MB boundary.
+    const size_t HUGEPAGE_SIZE = 2 * 1024 * 1024;
+    m_mappedSize = (totalRequested + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1);
+
+    // Memory Allocation via mmap
+    // Try to allocate memory using Hugepages first for better TLB performance
+    m_hugeBuffer = static_cast<uint8_t*>(mmap(
+        nullptr,
+        m_mappedSize,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+        -1, 0
+    ));
+
+    // Fallback: If Hugepages are not available/reserved, use standard 4KB pages
+    if (m_hugeBuffer == MAP_FAILED) {
+        m_hugeBuffer = static_cast<uint8_t*>(mmap(
+            nullptr,
+            m_mappedSize,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1, 0
+        ));
+    }
+
+    if (m_hugeBuffer == MAP_FAILED) {
+        throw std::runtime_error("Failed to allocate packet buffer via mmap");
+    }
+
+    // Set the base pointer for the recvmmsg logic
+    m_cachedBasePtr = m_hugeBuffer;
 
     // Initialize iovecs using the aligned stride
     for (int i = 0; i < m_config.batchSize; ++i) {
         // Calculate offset into the flat buffer
-        uint8_t* packetStart = basePtr + (i * m_alignedBufferSize);
+        uint8_t* packetStart = m_cachedBasePtr + (i * m_alignedBufferSize);
 
         // Map iovec to the specific row in our 2D vector
         m_ioVectors[i].iov_base = packetStart;
         m_ioVectors[i].iov_len = m_config.bufferSize;
 
+        // Reset the header structure
         std::memset(&m_msgHeaders[i], 0, sizeof(struct mmsghdr));
 
         // Protocol-agnostic address setup: done ONCE here
         m_msgHeaders[i].msg_hdr.msg_name = &m_senderAddrs[i];
 
         // Link the message header to the iovec
-        memset(&m_msgHeaders[i], 0, sizeof(struct mmsghdr));
         m_msgHeaders[i].msg_hdr.msg_iov = &m_ioVectors[i];
         m_msgHeaders[i].msg_hdr.msg_iovlen = 1;
     }
@@ -76,6 +103,11 @@ UDPReceiver::~UDPReceiver() {
     // try to call callbacks on this destroyed object.
     for (auto const& [port, fd] : m_port_to_fd_map) {
         m_loop.removeSource(fd);
+    }
+
+    // Manually unmap the buffer
+    if (m_hugeBuffer != nullptr && m_hugeBuffer != MAP_FAILED) {
+        ::munmap(m_hugeBuffer, m_mappedSize);
     }
 }
 

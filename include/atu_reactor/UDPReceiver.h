@@ -100,9 +100,6 @@ class UDPReceiver {
         // Maps port -> ScopedFd. RAII ensures sockets close on removal.
         std::map<int, ScopedFd> m_port_to_fd_map;
 
-        // Single contiguous buffer for all packets to improve cache locality
-        std::vector<uint8_t> m_flatBuffer;
-
         /**
          * Memory structures for recvmmsg.
          * Pre-allocated based on m_config to avoid heap allocation during the hot path.
@@ -114,6 +111,9 @@ class UDPReceiver {
         std::vector<struct sockaddr_storage> m_senderAddrs;
 
         uint8_t* m_cachedBasePtr = nullptr;
+
+        uint8_t* m_hugeBuffer = nullptr; // The pointer returned by mmap
+        size_t m_mappedSize = 0;      // To store the total size for munmap
 };
 
 }  // namespace atu_reactor
