@@ -48,6 +48,7 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
     uintptr_t rawAddr = reinterpret_cast<uintptr_t>(m_flatBuffer.data());
     uintptr_t alignedAddr = (rawAddr + 63) & ~63;
     uint8_t* basePtr = reinterpret_cast<uint8_t*>(alignedAddr);
+    m_cachedBasePtr = reinterpret_cast<uint8_t*>(alignedAddr);
 
     // Initialize iovecs using the aligned stride
     for (int i = 0; i < m_config.batchSize; ++i) {
@@ -219,10 +220,6 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
             MSG_DONTWAIT, nullptr);
     if (numPackets < 0) return;
 
-    // Get the same aligned base pointer we calculated in the constructor
-    uintptr_t alignedAddr = (reinterpret_cast<uintptr_t>(m_flatBuffer.data()) + 63) & ~63;
-    uint8_t* basePtr = reinterpret_cast<uint8_t*>(alignedAddr);
-
     // Iterate through only the number of packets actually received
     for (int k = 0; k < numPackets; ++k) {
         uint32_t status = PacketStatus::OK;
@@ -235,7 +232,7 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
         size_t len = m_msgHeaders[k].msg_len;
         if (len > 0) {
             // Data is at the specific offset in the flat buffer
-            uint8_t* packetData = basePtr + (k * m_alignedBufferSize);
+            uint8_t* packetData = m_cachedBasePtr + (k * m_alignedBufferSize);
             // Dispatch the packet to the user-defined handler
             handler(context, packetData, len, status);
         }

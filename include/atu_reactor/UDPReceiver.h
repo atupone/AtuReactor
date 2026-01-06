@@ -112,6 +112,8 @@ class UDPReceiver {
 
         // Store source addresses for the entire batch to avoid stack allocation in handleRead
         std::vector<struct sockaddr_storage> m_senderAddrs;
+
+        uint8_t* m_cachedBasePtr = nullptr;
 };
 
 }  // namespace atu_reactor
