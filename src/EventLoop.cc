@@ -47,8 +47,6 @@ EventLoop::EventLoop()
     if (m_epoll_fd < 0) throw std::runtime_error("Failed to create epoll");
     if (m_timer_fd < 0) throw std::runtime_error("Failed to create timerfd");
 
-    m_sources.resize(MAX_FDS);
-
     // Register the timer FD into the epoll loop immediately
     addSource(m_timer_fd, EPOLLIN, TimerTag{this}).value();
 }
@@ -65,19 +63,18 @@ Result<void> EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler ha
         return std::error_code(EBADF, std::generic_category());
     }
 
-    // Dynamic resizing to prevent out-of-bounds crashes
-    if (static_cast<size_t>(fd) >= m_sources.size()) {
-        m_sources.resize(static_cast<size_t>(fd) + 1);
-    }
-
-    // Store the callback in our local map
-    m_sources[fd].handler = handler;
-
     struct epoll_event ev{};
     ev.events = eventMask;
 
+    // Store the callback in our local map
     // Point epoll directly to the memory address of this source
-    ev.data.ptr = &m_sources[fd];
+    if (fd < MAX_FAST_FDS) {
+        m_fastSources[fd] = {handler};
+        ev.data.ptr = &m_fastSources[fd];
+    } else {
+        m_slowSources[fd] = {handler};
+        ev.data.ptr = &m_slowSources[fd];
+    }
 
     // Tell the kernel to start monitoring this FD
     if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
@@ -90,8 +87,10 @@ Result<void> EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler ha
 }
 
 Result<void> EventLoop::removeSource(int fd) {
-    if (fd < 0 || fd >= static_cast<int>(m_sources.size())) {
-        return std::error_code(EBADF, std::system_category());
+    if (fd < MAX_FAST_FDS) {
+        m_fastSources[fd].handler = std::monostate{};
+    } else {
+        m_slowSources.erase(fd);
     }
 
     // Remove from epoll
@@ -103,12 +102,6 @@ Result<void> EventLoop::removeSource(int fd) {
         // We can choose to return this error or ignore it.
         // Returning it is better for library debugging.
         return std::error_code(errno, std::system_category());
-    }
-
-    // Clear internal handler storage
-    // We check bounds to prevent a crash if a weird FD is passed
-    if (static_cast<size_t>(fd) < m_sources.size()) {
-        m_sources[static_cast<size_t>(fd)].handler = InternalHandler{};
     }
 
     return Result<void>::success();
@@ -133,19 +126,21 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
         // Retrieve the pointer we saved earlier
         Source* source = static_cast<Source*>(m_impl->events[i].data.ptr);
 
-        // 2. Dispatch using the pointer
-        std::visit([this](auto&& arg) {
-            using T = std::decay_t<decltype(arg)>;
+        if (source) {
+            // 2. Dispatch using the pointer
+            std::visit([this](auto&& arg) {
+                using T = std::decay_t<decltype(arg)>;
 
-            if constexpr (std::is_same_v<T, TimerTag>) {
-                // Timers generally only trigger on EPOLLIN,
-                // but we call it normally.
-                handleTimerRead();
-            } else if constexpr (std::is_same_v<T, UDPReceiverTag>) {
-                // Pass the event to the receiver
-                arg.receiver->handleRead(arg.fd, arg.userContext, arg.handler);
-            }
-        }, source->handler);
+                if constexpr (std::is_same_v<T, TimerTag>) {
+                    // Timers generally only trigger on EPOLLIN,
+                    // but we call it normally.
+                    handleTimerRead();
+                } else if constexpr (std::is_same_v<T, UDPReceiverTag>) {
+                    // Pass the event to the receiver
+                    arg.receiver->handleRead(arg.fd, arg.userContext, arg.handler);
+                }
+            }, source->handler);
+        }
     }
 
     // Final success return to satisfy the Result<void> return type

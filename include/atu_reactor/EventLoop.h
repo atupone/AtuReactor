@@ -145,7 +145,6 @@ class EventLoop {
         void insertTimer(Timer t);
 
         static constexpr int MAX_EVENTS = 128; // Buffer size for events returned per wait
-        static constexpr int MAX_FDS = 1024; // Limit for direct indexing
 
         // RAII wrapper for the epoll instance file descriptor
         ScopedFd m_epoll_fd;
@@ -158,8 +157,10 @@ class EventLoop {
             InternalHandler handler;
         };
 
-        // Maps FD -> User Callback for O(1) lookups during the event loop
-        std::vector<Source> m_sources;
+        // Hybrid storage to prevent massive allocations on high FD numbers
+        static constexpr int MAX_FAST_FDS = 1024; // Limit for direct indexing
+        Source m_fastSources[MAX_FAST_FDS];
+        std::unordered_map<int, Source> m_slowSources;
 
         // Ordered queue of pending timers
         std::set<Timer> m_timers;
