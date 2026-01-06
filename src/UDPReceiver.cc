@@ -116,6 +116,11 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         return std::error_code(errno, std::system_category());
     }
 
+    int reusePort = 1;
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
+        return std::error_code(errno, std::system_category());
+    }
+
     if (isV6) {
         // Allow IPv4 packets on this IPv6 socket
         int off = 0;
