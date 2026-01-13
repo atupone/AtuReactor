@@ -27,6 +27,13 @@ set(ATU_REACTOR_SOVERSION 0)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+# 1. Generate the Config file from the template
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AtuReactorConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/AtuReactorConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/AtuReactor"
+)
+
 # ---------------------------------------------------------------------------
 # COMPILER SETTINGS
 # ---------------------------------------------------------------------------
@@ -105,8 +112,9 @@ install(EXPORT AtuReactorTargets
 )
 
 # Install the Config and Version files
-install(FILES
-    "cmake/AtuReactorConfig.cmake"
+install(
+    FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/AtuReactorConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/AtuReactorConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/AtuReactor
 )
