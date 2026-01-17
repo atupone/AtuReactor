@@ -114,6 +114,9 @@ class UDPReceiver {
 
         uint8_t* m_hugeBuffer = nullptr; // The pointer returned by mmap
         size_t m_mappedSize = 0;      // To store the total size for munmap
+
+        // Add a member to hold control buffers for the batch
+        std::vector<std::array<uint8_t, CMSG_SPACE(3 * sizeof(struct timespec))>> m_controlBuffers;
 };
 
 }  // namespace atu_reactor

@@ -36,21 +36,23 @@ public:
         std::vector<uint8_t> data;
         size_t size;
         uint32_t status;
+        struct timespec ts;
     };
 
     std::vector<ReceivedPacket> receivedPackets;
 
-    void handlePacket(const uint8_t data[], size_t size, uint32_t status) {
+    void handlePacket(const uint8_t data[], size_t size, uint32_t status, struct timespec ts) {
         receivedPackets.push_back({
             std::vector<uint8_t>(data, data + size),
             size,
-            status
+            status,
+            ts
         });
     }
 
     // Static bridge function required by the new UDPReceiver API
-    static void onPacket(void* context, const uint8_t* data, size_t len, uint32_t status) {
-        static_cast<MockPacketHandler*>(context)->handlePacket(data, len, status);
+    static void onPacket(void* context, const uint8_t* data, size_t len, uint32_t status, struct timespec ts) {
+        static_cast<MockPacketHandler*>(context)->handlePacket(data, len, status, ts);
     }
 
     void clear() { receivedPackets.clear(); }
@@ -276,4 +278,29 @@ TEST_F(UDPReceiverTest, NormalPacketsHaveOkStatus) {
 
     ASSERT_EQ(handler.receivedPackets.size(), 1);
     EXPECT_EQ(handler.receivedPackets[0].status, PacketStatus::OK);
+}
+
+/**
+ *  * @brief Verify that packets received have a valid kernel timestamp.
+ *   */
+TEST_F(UDPReceiverTest, ProvidesKernelTimestamps) {
+    UDPReceiver receiver(loop);
+    auto result = receiver.subscribe(TEST_PORT, &handler, &MockPacketHandler::onPacket);
+    ASSERT_TRUE(result.has_value());
+
+    std::string payload = "timestamp_test";
+    sendUdpPacket(std::vector<uint8_t>(payload.begin(), payload.end()), TEST_PORT);
+
+    loop.runOnce(100); // Poll the reactor
+
+    ASSERT_EQ(handler.receivedPackets.size(), 1);
+
+    // Verify timestamp is not empty/zero
+    const auto& ts = handler.receivedPackets[0].ts;
+    EXPECT_GT(ts.tv_sec, 0); 
+
+    // Optional: Verify it's "recent" (within the last 10 seconds)
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    EXPECT_LT(now.tv_sec - ts.tv_sec, 10);
 }

@@ -28,7 +28,7 @@ public:
     }
 
     // Static bridge function
-    static void bridge(void* context, const uint8_t* data, size_t len, uint32_t status) {
+    static void bridge(void* context, const uint8_t* data, size_t len, uint32_t status, struct timespec) {
         static_cast<GenericHandler*>(context)->process(data, len, status);
     }
 };

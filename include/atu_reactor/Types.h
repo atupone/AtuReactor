@@ -32,7 +32,8 @@ namespace atu_reactor {
     using PacketHandlerFn = void (*)(void* context,
                                      const uint8_t* data,
                                      size_t len,
-                                     uint32_t status);
+                                     uint32_t status,
+                                     struct timespec ts);
 
 }  // namespace atu_reactor
 

@@ -26,7 +26,7 @@ public:
     }
 
     // THE BRIDGE: Matches PacketHandlerFn signature
-    static void onPacketReceived(void* context, const uint8_t* data, size_t len, uint32_t status) {
+    static void onPacketReceived(void* context, const uint8_t* data, size_t len, uint32_t status, struct timespec) {
         static_cast<EchoHandler*>(context)->onData(data, len, status);
     }
 };

@@ -38,6 +38,8 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
         m_msgHeaders(config.batchSize),
         m_senderAddrs(config.batchSize)
 {
+    m_controlBuffers.resize(config.batchSize);
+
     // Calculate size and alignment
     // Round up the buffer size to a multiple of 64 for cache-line alignment
     m_alignedBufferSize = (m_config.bufferSize + 63) & ~63; // Round up to multiple of 64
@@ -154,6 +156,11 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         return std::error_code(errno, std::system_category());
     }
 
+    int enabled = 1;
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
+        return std::error_code(errno, std::system_category());
+    }
+
     if (isV6) {
         // Allow IPv4 packets on this IPv6 socket
         int off = 0;
@@ -239,10 +246,10 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
     assert(std::this_thread::get_id() == m_ownerThreadId && 
             "UDPReceiver handled on wrong thread!");
 
-    // 1. Reset the lengths BEFORE the system call.
-    // This ensures the kernel can write the full address for every packet slot.
-    for (auto& header : m_msgHeaders) {
-        header.msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+    // Initialize m_msgHeaders to point to these control buffers
+    for (int i = 0; i < m_config.batchSize; ++i) {
+        m_msgHeaders[i].msg_hdr.msg_control = m_controlBuffers[i].data();
+        m_msgHeaders[i].msg_hdr.msg_controllen = m_controlBuffers[i].size();
     }
 
     // recvmmsg allows us to grab up to BATCH_SIZE packets in one go.
@@ -261,12 +268,25 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
             status |= PacketStatus::TRUNCATED;
         }
 
+        struct timespec packetTime = {0, 0};
+
+        // Extract timestamp from control messages
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&m_msgHeaders[k].msg_hdr);
+             cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&m_msgHeaders[k].msg_hdr, cmsg)) {
+
+            if ((cmsg->cmsg_level == SOL_SOCKET) && (cmsg->cmsg_type == SCM_TIMESTAMPNS)) {
+                packetTime = *(struct timespec*)CMSG_DATA(cmsg);
+                break;
+            }
+        }
+
         size_t len = m_msgHeaders[k].msg_len;
         if (len > 0) {
             // Data is at the specific offset in the flat buffer
             uint8_t* packetData = m_cachedBasePtr + (k * m_alignedBufferSize);
             // Dispatch the packet to the user-defined handler
-            handler(context, packetData, len, status);
+            handler(context, packetData, len, status, packetTime);
         }
     }
 }
