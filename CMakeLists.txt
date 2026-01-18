@@ -18,7 +18,7 @@ cmake_minimum_required(VERSION 3.10)
 project(AtuReactor LANGUAGES CXX)
 
 # Define the version and compatibility version
-set(ATU_REACTOR_VERSION 0.0.6)
+set(ATU_REACTOR_VERSION 0.0.9)
 set(ATU_REACTOR_SOVERSION 0)
 
 # ---------------------------------------------------------------------------
