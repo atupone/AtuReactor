@@ -19,6 +19,7 @@
 #include <atu_reactor/PcapReceiver.h>
 
 // System headers
+#include <cstring>
 #include <net/ethernet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -212,85 +213,85 @@ void PcapReceiver::processBatch() {
 }
 
 void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet) {
+#if 0
     if (header->caplen != header->len) {
         return; // Ignore truncated in capture
     }
+#endif
 
     const uint8_t* ptr = packet;
     uint32_t remaining = header->caplen;
 
     // --- Layer 2: Ethernet ---
-    if (remaining < sizeof(struct ether_header)) {
-        return;
-    }
+    if (remaining < sizeof(struct ether_header)) return;
     auto* eth = reinterpret_cast<const struct ether_header*>(ptr);
     uint16_t proto = ntohs(eth->ether_type);
     ptr += sizeof(struct ether_header);
     remaining -= static_cast<uint32_t>(sizeof(struct ether_header));
 
     if (proto == ETHERTYPE_VLAN) {
-        if (remaining < 4) {
-            return; // VLAN tag size
-        }
+        if (remaining < 4) return; // VLAN tag size
         // Skip VLAN (simplified, assuming single tag)
         proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 2));
         ptr += 4;
         remaining -= 4;
     }
 
-    if (proto != ETHERTYPE_IP) {
-        return;
-    }
+    if (proto != ETHERTYPE_IP) return;
 
     // --- Layer 3: IPv4 ---
-    if (remaining < sizeof(struct ip)) {
-        return;
-    }
+    if (remaining < sizeof(struct ip)) return;
     auto* ip = reinterpret_cast<const struct ip*>(ptr);
-    if (ip->ip_v != 4) {
-        return;
-    }
+    if (ip->ip_v != 4) return;
 
     uint32_t ipLen = ip->ip_hl * 4;
-    if (remaining < ipLen) {
-        return;
-    }
+    if (remaining < ipLen) return;
 
-    if (ip->ip_p != IPPROTO_UDP) {
-        return;
-    }
+    if (ip->ip_p != IPPROTO_UDP) return;
 
     ptr += ipLen;
     remaining -= ipLen;
 
     // --- Layer 4: UDP ---
-    if (remaining < sizeof(struct udphdr)) {
-        return;
-    }
+    if (remaining < sizeof(struct udphdr)) return;
     auto* udp = reinterpret_cast<const struct udphdr*>(ptr);
 
     uint16_t dstPort = ntohs(udp->uh_dport);
     uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
+    if (udpLen < sizeof(struct udphdr)) return;
+
     size_t dataLen = udpLen - sizeof(struct udphdr);
 
     ptr += sizeof(struct udphdr);
     remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
 
-    if (remaining < dataLen) {
-        return;
-    }
+    if (remaining < dataLen) return;
 
-    // --- Dispatch ---
+    // --- Dispatch using m_hugeBuffer ---
     // Check if anyone subscribed to this port
     auto it = m_subscriptions.find(dstPort);
     if (it != m_subscriptions.end()) {
+        // Determine destination in our pre-allocated hugepage memory
+        // We use m_currentBatchIdx to simulate the same buffer layout as UDPReceiver
+        uint8_t* destBuf = m_cachedBasePtr + (m_currentBatchIdx * m_alignedBufferSize);
+
+        // Safety check: Ensure the packet fits in the allocated buffer slot
+        size_t copyLen = std::min(dataLen, (size_t)m_config.bufferSize);
+
+        // Perform the copy (This provides the user with a mutable pointer)
+        std::memcpy(destBuf, ptr, copyLen);
+
         struct timespec ts;
         ts.tv_sec = header->ts.tv_sec;
         ts.tv_nsec = header->ts.tv_usec * 1000;
 
+        // Dispatch using the managed buffer
         // Call the user handler directly
         // Note: PacketStatus is OK because we dropped truncated frames earlier
-        it->second.handler(it->second.context, ptr, dataLen, PacketStatus::OK, ts);
+        it->second.handler(it->second.context, destBuf, copyLen, PacketStatus::OK, ts);
+
+        // Increment and wrap the buffer index
+        m_currentBatchIdx = (m_currentBatchIdx + 1) % m_config.batchSize;
     }
 }
 

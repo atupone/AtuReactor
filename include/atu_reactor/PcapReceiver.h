@@ -109,6 +109,8 @@ class PcapReceiver : public PacketReceiver {
         struct timespec m_pcapStartTs = {0, 0}; // TS of first packet in file
         std::chrono::steady_clock::time_point m_wallStartTs; // Wall time when replay started
         bool m_firstPacket = true;
+
+        uint32_t m_currentBatchIdx = 0; // Tracks which buffer slot to use
 };
 
 }  // namespace atu_reactor
