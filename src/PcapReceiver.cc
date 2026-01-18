@@ -51,6 +51,10 @@ Result<void> PcapReceiver::open(const std::string& path) {
         // We simulate an IO error if pcap fails
         return std::error_code(EIO, std::system_category());
     }
+
+    // Capture the link type (e.g., DLT_EN10MB or DLT_LINUX_SLL)
+    m_linkType = pcap_datalink(m_pcapHandle);
+
     return Result<void>::success();
 }
 
@@ -213,28 +217,40 @@ void PcapReceiver::processBatch() {
 }
 
 void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet) {
-#if 0
-    if (header->caplen != header->len) {
-        return; // Ignore truncated in capture
-    }
-#endif
+    if (header->caplen != header->len) return; // Ignore truncated in capture
 
     const uint8_t* ptr = packet;
     uint32_t remaining = header->caplen;
+    uint16_t proto = 0;
 
-    // --- Layer 2: Ethernet ---
-    if (remaining < sizeof(struct ether_header)) return;
-    auto* eth = reinterpret_cast<const struct ether_header*>(ptr);
-    uint16_t proto = ntohs(eth->ether_type);
-    ptr += sizeof(struct ether_header);
-    remaining -= static_cast<uint32_t>(sizeof(struct ether_header));
+    // --- Layer 2: Dynamic Decapsulation ---
+    if (m_linkType == 113) { // DLT_LINUX_SLL (Linux Cooked)
+        if (remaining < 16) return;
+        // Protocol is at offset 14 (big endian)
+        proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 14));
+        ptr += 16;
+        remaining -= 16;
+    }
+    else if (m_linkType == DLT_EN10MB) { // Standard Ethernet
+        // --- Layer 2: Ethernet ---
+        if (remaining < sizeof(struct ether_header)) return;
+        auto* eth = reinterpret_cast<const struct ether_header*>(ptr);
+        proto = ntohs(eth->ether_type);
+        ptr += sizeof(struct ether_header);
+        remaining -= static_cast<uint32_t>(sizeof(struct ether_header));
 
-    if (proto == ETHERTYPE_VLAN) {
-        if (remaining < 4) return; // VLAN tag size
-        // Skip VLAN (simplified, assuming single tag)
-        proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 2));
-        ptr += 4;
-        remaining -= 4;
+        // Handle 802.1Q VLAN Tagging
+        if (proto == ETHERTYPE_VLAN) {
+            if (remaining < 4) return; // VLAN tag size
+            // Skip VLAN (simplified, assuming single tag)
+            proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 2));
+            ptr += 4;
+            remaining -= 4;
+        }
+    }
+    else {
+        // Unsupported link type (e.g. DLT_NULL/Loopback or DLT_RAW)
+        return;
     }
 
     if (proto != ETHERTYPE_IP) return;

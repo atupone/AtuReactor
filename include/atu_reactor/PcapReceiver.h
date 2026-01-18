@@ -111,6 +111,7 @@ class PcapReceiver : public PacketReceiver {
         bool m_firstPacket = true;
 
         uint32_t m_currentBatchIdx = 0; // Tracks which buffer slot to use
+        int m_linkType = -1; // Added to store DLT from pcap_datalink()
 };
 
 }  // namespace atu_reactor
