@@ -112,6 +112,11 @@ class PcapReceiver : public PacketReceiver {
 
         uint32_t m_currentBatchIdx = 0; // Tracks which buffer slot to use
         int m_linkType = -1; // Added to store DLT from pcap_datalink()
+
+        // Dedicated buffer for the "next" scheduled packet to avoid heap allocs
+        std::vector<uint8_t> m_pendingPacketBuf;
+        struct pcap_pkthdr m_pendingHeader;
+        bool m_hasPending = false;
 };
 
 }  // namespace atu_reactor

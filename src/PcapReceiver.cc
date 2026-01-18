@@ -129,7 +129,7 @@ void PcapReceiver::scheduleNext() {
 }
 
 void PcapReceiver::processBatch() {
-    if (!m_pcapHandle) {
+    if (!m_pcapHandle || m_hasPending) {
         return;
     }
 
@@ -149,13 +149,8 @@ void PcapReceiver::processBatch() {
 
         // Read Packet
         int res = pcap_next_ex(m_pcapHandle, &header, &packetData);
-        if (res == -2) {
-            /* EOF */
-            return;
-        }
-        if (res != 1) {
-            continue; // Error or timeout, retry
-        }
+        if (res == -2) return; // EOF
+        if (res != 1) continue; // Error or timeout, retry
 
         // Timing Logic (TIMED Mode only)
         if (m_pcapConfig.mode == ReplayMode::TIMED) {
@@ -184,6 +179,17 @@ void PcapReceiver::processBatch() {
                 auto now = std::chrono::steady_clock::now();
 
                 if (targetTime > now) {
+                    // ZERO HEAP ALLOCATION:
+                    // Ensure internal buffer is large enough (no-op after first few packets)
+                    if (m_pendingPacketBuf.capacity() < header->caplen) {
+                        m_pendingPacketBuf.reserve(header->caplen);
+                    }
+
+                    // Copy data into reusable member memory
+                    m_pendingPacketBuf.assign(packetData, packetData + header->caplen);
+                    m_pendingHeader = *header;
+                    m_hasPending = true;
+
                     // This packet is in the future.
                     // We cannot process it yet. We must sleep (schedule timer) and retry.
                     // Note: pcap_next_ex ALREADY advanced the pointer. This is tricky.
@@ -195,13 +201,11 @@ void PcapReceiver::processBatch() {
 
                     // Capture the necessary data for THIS packet to run later
                     // We must copy the data because pcap internal buffer might change?
-                    // Actually, pcap ring buffer is usually valid until next call, but let's be safe.
-                    std::vector<uint8_t> safeBuf(packetData, packetData + header->caplen);
-                    struct pcap_pkthdr safeHdr = *header;
 
-                    m_loop.runAfter(delay, [this, safeBuf = std::move(safeBuf), safeHdr]() {
+                    m_loop.runAfter(delay, [this]() {
                         // Dispatch the delayed packet
-                        parseAndDispatch(&safeHdr, safeBuf.data());
+                        this->parseAndDispatch(&m_pendingHeader, m_pendingPacketBuf.data());
+                        this->m_hasPending = false;
                         // Resume normal processing loop
                         processBatch();
                     });
