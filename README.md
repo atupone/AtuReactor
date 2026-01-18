@@ -10,6 +10,7 @@
 * **Batch UDP Reception**: Utilizes `recvmmsg` to pull multiple packets from the kernel in a single system call.
 * **Hugepage Support**: Supports `MAP_HUGETLB` via `mmap` to reduce TLB misses and improve deterministic performance under high load.
 * **Precision Kernel Timestamps**: Native support for nanosecond-precision timestamps via `SO_TIMESTAMPNS` and `SO_TIMESTAMPING`.
+* **PCAP Replay Engine**: Native support for replaying network captures through the same event-driven interface, ideal for backtesting.
 * **Dual-Stack IPv6 Support**: Automatically handles both IPv4 and IPv6 traffic on the same port using a single subscription.
 * **Safety & Robustness**: Reports kernel-level events like packet truncation (`MSG_TRUNC`) via a status bitmask.
 * **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to match CPU cache lines.
@@ -21,8 +22,6 @@
 ## ⚡ Advanced Optimization: Hugepages (`MAP_HUGETLB`)
 
 AtuReactor supports **Hugepages** for its internal packet buffers. By using 2MB pages instead of the standard 4KB pages, the CPU's Translation Lookaside Buffer (TLB) can cover a much larger memory area with fewer entries.
-
-
 
 ### 1. Enable Hugepages in the Linux Kernel
 ```bash
@@ -41,8 +40,6 @@ When `UDPReceiver` is initialized, it calculates the required memory for your `b
 
 AtuReactor provides robust support for nanosecond-precision timestamps to eliminate user-space jitter.
 
-
-
 ### Implementation Details
 * **Dual API Support**: The library parses both `SCM_TIMESTAMPNS` and `SCM_TIMESTAMPING` ancillary data.
 * **Metadata Persistence**: Unlike standard implementations, AtuReactor manually resets `msg_controllen` before every batch read. This prevents the kernel from "shrinking" the metadata buffer, ensuring stable timestamp delivery across packet bursts.
@@ -55,6 +52,7 @@ AtuReactor provides robust support for nanosecond-precision timestamps to elimin
 ### 1. Define a Callback
 ```cpp
 #include <atu_reactor/UDPReceiver.h>
+#include <iostream>
 
 void onPacketReceived(void* context, const uint8_t* data, size_t size, uint32_t status, struct timespec ts) {
     if (ts.tv_sec > 0) {
@@ -64,8 +62,11 @@ void onPacketReceived(void* context, const uint8_t* data, size_t size, uint32_t 
 }
 ```
 
-### 2. Run the Event Loop
+### 2. Live UDP Reception
 ```cpp
+#include <atu_reactor/EventLoop.h>
+#include <atu_reactor/UDPReceiver.h>
+
 int main() {
     atu_reactor::EventLoop loop;
     atu_reactor::UDPReceiver receiver(loop);
@@ -75,6 +76,38 @@ int main() {
         while (true) {
             loop.runOnce(1000); 
         }
+    }
+    return 0;
+}
+```
+
+### 3. PCAP Replay Usage
+The `PcapReceiver` allows you to process `.pcap` files using the same callback logic as the live receiver. This allows for seamless transitions between offline analysis and live production code.
+
+```cpp
+#include <atu_reactor/PcapReceiver.h>
+#include <atu_reactor/EventLoop.h>
+
+int main() {
+    atu_reactor::EventLoop loop;
+    
+    // Configure replay behavior
+    atu_reactor::PcapConfig config;
+    config.loop = false; // Set to true to restart file at EOF
+    
+    atu_reactor::PcapReceiver reader(loop, config);
+    if (!reader.open("capture.pcap")) {
+        return 1;
+    }
+
+    // Subscribe to a specific port within the PCAP
+    reader.subscribe(12345, nullptr, onPacketReceived);
+    
+    // Begin reading and injecting into the loop
+    reader.start();
+    
+    while (true) {
+        loop.runOnce(100);
     }
     return 0;
 }
