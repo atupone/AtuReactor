@@ -17,31 +17,15 @@
 
 #pragma once
 
+// Inherits from
+#include <atu_reactor/PacketReceiver.h>
+
 // System headers
-#include <map>
+#include <netinet/in.h>
 #include <sys/socket.h>
-#include <thread>
 #include <vector>
 
-// Library headers
-#include <atu_reactor/EventLoop.h>
-#include <atu_reactor/Result.h>
-#include <atu_reactor/ScopedFd.h>
-#include <atu_reactor/Types.h>
-
 namespace atu_reactor {
-
-/**
- * @brief Configuration for UDPReceiver performance tuning.
- */
-struct ReceiverConfig {
-    int maxFds = 128;         // Limit to prevent FD exhaustion
-    int batchSize = 64;       // Number of packets to pull via recvmmsg
-    int bufferSize = 2048;    // Sufficient for standard MTU + headers
-};
-
-// Define the function pointer type here
-
 
 /**
  * @class UDPReceiver
@@ -51,7 +35,7 @@ struct ReceiverConfig {
  * including subscription and the eventual EventLoop::runOnce() dispatch,
  * MUST be executed on the same thread.
  */
-class UDPReceiver {
+class UDPReceiver : public PacketReceiver {
     // Grant EventLoop access to private members like handleRead
     friend class EventLoop;
 
@@ -64,7 +48,7 @@ class UDPReceiver {
         explicit UDPReceiver(EventLoop& loop, ReceiverConfig config = {});
 
         // Destructor ensures FDs are removed from the EventLoop before closing
-        ~UDPReceiver();
+        ~UDPReceiver() override = default;
 
         /**
          * @brief Creates a UDP socket, binds it to localPort, and registers it with the EventLoop.
@@ -74,49 +58,30 @@ class UDPReceiver {
          */
         [[nodiscard]] Result<int> subscribe(uint16_t localPort, void* context, PacketHandlerFn handler);
 
-        /**
-         * @brief Closes the socket for a port and removes it from the EventLoop.
-         * @param localPort The port to stop listening on.
-         */
-        Result<void> unsubscribe(uint16_t localPort);
-
         // Disable copy/move to strictly manage resource identity
         UDPReceiver(const UDPReceiver&) = delete;
         UDPReceiver& operator=(const UDPReceiver&) = delete;
         UDPReceiver(UDPReceiver&&) = delete;
         UDPReceiver& operator=(UDPReceiver&&) = delete;
 
-    private:
+    protected:
         /**
          * @brief Internal callback triggered by EventLoop when a socket has data.
          */
         void handleRead(int fd, void* context, PacketHandlerFn handler);
 
-        EventLoop& m_loop;
-        ReceiverConfig m_config;
-        size_t m_alignedBufferSize; // Added for cache-line alignment
-        std::thread::id m_ownerThreadId; // Added for thread-safety asserts
-
-        // Maps port -> ScopedFd. RAII ensures sockets close on removal.
-        std::map<int, ScopedFd> m_port_to_fd_map;
-
+    private:
         /**
          * Memory structures for recvmmsg.
          * Pre-allocated based on m_config to avoid heap allocation during the hot path.
          */
-        std::vector<struct iovec> m_ioVectors;             // Points to packetBuffers
         std::vector<struct mmsghdr> m_msgHeaders;          // Kernel-to-user metadata
 
         // Store source addresses for the entire batch to avoid stack allocation in handleRead
         std::vector<struct sockaddr_storage> m_senderAddrs;
 
-        uint8_t* m_cachedBasePtr = nullptr;
-
-        uint8_t* m_hugeBuffer = nullptr; // The pointer returned by mmap
-        size_t m_mappedSize = 0;      // To store the total size for munmap
-
         // Add a member to hold control buffers for the batch
-        std::vector<std::array<uint8_t, CMSG_SPACE(3 * sizeof(struct timespec))>> m_controlBuffers;
+        std::vector<std::array<uint8_t, CMSG_SPACE(sizeof(struct timespec))>> m_controlBuffers;
 };
 
 }  // namespace atu_reactor

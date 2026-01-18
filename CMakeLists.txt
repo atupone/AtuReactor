@@ -61,6 +61,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(AtuReactor SHARED
     src/EventLoop.cc
+    src/PacketReceiver.cc
     src/UDPReceiver.cc
 )
 

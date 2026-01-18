@@ -19,112 +19,41 @@
 #include <atu_reactor/UDPReceiver.h>
 
 // System headers
-#include <cassert>
 #include <cstring>
-#include <fcntl.h>
-#include <iostream>
-#include <netinet/in.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 
 namespace atu_reactor {
 
 UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
-        : m_loop(loopRef),
-        m_config(config),
-        m_ownerThreadId(std::this_thread::get_id()),
+        : PacketReceiver(loopRef, config),
         // Allocate ONE big chunk of memory for all packets
-        m_ioVectors(config.batchSize),
         m_msgHeaders(config.batchSize),
-        m_senderAddrs(config.batchSize)
+        m_senderAddrs(config.batchSize),
+        m_controlBuffers(config.batchSize)
 {
-    m_controlBuffers.resize(config.batchSize);
-
-    // Calculate size and alignment
-    // Round up the buffer size to a multiple of 64 for cache-line alignment
-    m_alignedBufferSize = (m_config.bufferSize + 63) & ~63; // Round up to multiple of 64
-
-    // Total memory needed for all packets
-    size_t totalRequested = config.batchSize * m_alignedBufferSize;
-
-    // Hugepages are typically 2MB. We round up the total mapping size to a 2MB boundary.
-    const size_t HUGEPAGE_SIZE = 2 * 1024 * 1024;
-    m_mappedSize = (totalRequested + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1);
-
-    // Memory Allocation via mmap
-    // Try to allocate memory using Hugepages first for better TLB performance
-    m_hugeBuffer = static_cast<uint8_t*>(mmap(
-        nullptr,
-        m_mappedSize,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
-        -1, 0
-    ));
-
-    // Fallback: If Hugepages are not available/reserved, use standard 4KB pages
-    if (m_hugeBuffer == MAP_FAILED) {
-        m_hugeBuffer = static_cast<uint8_t*>(mmap(
-            nullptr,
-            m_mappedSize,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1, 0
-        ));
-    }
-
-    if (m_hugeBuffer == MAP_FAILED) {
-        throw std::runtime_error("Failed to allocate packet buffer via mmap");
-    }
-
-    // Set the base pointer for the recvmmsg logic
-    m_cachedBasePtr = m_hugeBuffer;
-
     // Initialize iovecs using the aligned stride
     for (int i = 0; i < m_config.batchSize; ++i) {
-        // Calculate offset into the flat buffer
-        uint8_t* packetStart = m_cachedBasePtr + (i * m_alignedBufferSize);
-
-        // Map iovec to the specific row in our 2D vector
-        m_ioVectors[i].iov_base = packetStart;
-        m_ioVectors[i].iov_len = m_config.bufferSize;
-
         // Reset the header structure
         std::memset(&m_msgHeaders[i], 0, sizeof(struct mmsghdr));
 
-        // Protocol-agnostic address setup: done ONCE here
-        m_msgHeaders[i].msg_hdr.msg_name = &m_senderAddrs[i];
+        struct msghdr& h = m_msgHeaders[i].msg_hdr;
 
-        // Link the message header to the iovec
-        m_msgHeaders[i].msg_hdr.msg_iov = &m_ioVectors[i];
-        m_msgHeaders[i].msg_hdr.msg_iovlen = 1;
-    }
-}
+        // Data Buffers: Point to 64-byte aligned memory from PacketReceiver base
+        h.msg_iov = &m_ioVectors[i];
+        h.msg_iovlen = 1;
 
-UDPReceiver::~UDPReceiver() {
-    // Safety: Explicitly remove all sources from EventLoop so it doesn't
-    // try to call callbacks on this destroyed object.
-    for (auto const& [port, fd] : m_port_to_fd_map) {
-        m_loop.removeSource(fd);
-    }
+        // Source Address: Protocol-agnostic storage for dual-stack (IPv4/IPv6)
+        h.msg_name = &m_senderAddrs[i];
 
-    // Manually unmap the buffer
-    if (m_hugeBuffer != nullptr && m_hugeBuffer != MAP_FAILED) {
-        ::munmap(m_hugeBuffer, m_mappedSize);
+        // Ancillary Data: Control buffers for HW timestamps/metadata
+        h.msg_control = m_controlBuffers[i].data();
     }
 }
 
 Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn handler) {
-    if (handler == nullptr) {
-        return std::error_code(EINVAL, std::system_category());
-    }
-
-    // Use the OS limit check only if you explicitly want to cap this instance
-    if (m_config.maxFds > 0 && m_port_to_fd_map.size() >= static_cast<size_t>(m_config.maxFds)) {
-        return std::error_code(EMFILE, std::system_category());
-    }
-
-    if (m_port_to_fd_map.find(port) != m_port_to_fd_map.end()) {
-        return std::error_code(EADDRINUSE, std::system_category());
+    auto baseRes = PacketReceiver::subscribe(port, context, handler);
+    if (!baseRes.has_value()) {
+        return Result<int>(baseRes.error());
     }
 
     // Attempt IPv6 Dual-Stack Socket
@@ -191,11 +120,12 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     if (getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
         return std::error_code(errno, std::system_category());
     }
+
     uint16_t localPort = (ss.ss_family == AF_INET6)
         ? ntohs(reinterpret_cast<struct sockaddr_in6*>(&ss)->sin6_port)
         : ntohs(reinterpret_cast<struct sockaddr_in*>(&ss)->sin_port);
 
-    // Register with the EventLoop
+    // Register with the EventLoop using your custom Tag
     auto regResult = m_loop.addSource(udp_socket, EPOLLIN, UDPReceiverTag{
         this,
         (int)udp_socket,
@@ -215,40 +145,15 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     return {static_cast<int>(localPort)};
 }
 
-Result<void> UDPReceiver::unsubscribe(uint16_t port) {
-    // Find the port in our map
-    auto it = m_port_to_fd_map.find(port);
-
-    // If it doesn't exist, return an error instead of silently doing nothing
-    if (it == m_port_to_fd_map.end()) {
-        return std::error_code(ENOENT, std::system_category());
-    }
-
-    // Get the raw FD to remove it from the EventLoop
-    int fd = it->second;
-
-    // Remove from EventLoop (Internal epoll_ctl DEL)
-    auto loopRes = m_loop.removeSource(fd);
-
-    // Remove from our map
-    // Because m_port_to_fd_map stores ScopedFd, the destructor
-    // of ScopedFd will automatically call ::close(fd) here.
-    m_port_to_fd_map.erase(it);
-
-    // Return the loop result (or success if we don't care about epoll_ctl DEL errors)
-    return loopRes;
-}
-
 // NOTE: handleRead assumes exclusive access to m_flatBuffer.
 // If multiple threads trigger handleRead simultaneously via different
 // EventLoops, data corruption will occur.
 void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
-    assert(std::this_thread::get_id() == m_ownerThreadId && 
-            "UDPReceiver handled on wrong thread!");
+    checkThread();
 
     // Initialize m_msgHeaders to point to these control buffers
     for (int i = 0; i < m_config.batchSize; ++i) {
-        m_msgHeaders[i].msg_hdr.msg_control = m_controlBuffers[i].data();
+        m_msgHeaders[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
         m_msgHeaders[i].msg_hdr.msg_controllen = m_controlBuffers[i].size();
     }
 
