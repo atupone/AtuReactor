@@ -63,6 +63,7 @@ add_library(AtuReactor SHARED
     src/EventLoop.cc
     src/PacketReceiver.cc
     src/UDPReceiver.cc
+    src/PcapReceiver.cc
 )
 
 add_library(AtuReactor::AtuReactor ALIAS AtuReactor)
@@ -79,6 +80,7 @@ set_target_properties(AtuReactor PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+target_link_libraries(AtuReactor PUBLIC pcap)
 # ---------------------------------------------------------------------------
 # INSTALLATION & PACKAGE CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -144,6 +146,10 @@ if(BUILD_EXAMPLES)
     # 3. Timer Usage
     add_executable(example_timers examples/TimerUsage.cc)
     target_link_libraries(example_timers PRIVATE AtuReactor)
+
+    # 4. pcap replay
+    add_executable(pcap_replay.cc examples/pcap_replay.cc)
+    target_link_libraries(pcap_replay.cc PRIVATE AtuReactor)
 
     message(STATUS "Example programs are enabled")
 else()
