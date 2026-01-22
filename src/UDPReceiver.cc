@@ -51,8 +51,7 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
 }
 
 Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn handler) {
-    auto baseRes = PacketReceiver::subscribe(port, context, handler);
-    if (!baseRes.has_value()) {
+    if (auto baseRes = PacketReceiver::subscribe(port, context, handler); !baseRes.has_value()) {
         return Result<int>(baseRes.error());
     }
 
@@ -75,18 +74,15 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     ScopedFd udp_socket(raw_fd);
 
     // Reuse Address: Allows immediate restart of the application
-    int optval = 1;
-    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+    if (int optval = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
         return std::error_code(errno, std::system_category());
     }
 
-    int reusePort = 1;
-    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
+    if (int reusePort = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
         return std::error_code(errno, std::system_category());
     }
 
-    int enabled = 1;
-    if (setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
+    if (int enabled = 1; setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
         return std::error_code(errno, std::system_category());
     }
 
@@ -116,8 +112,7 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
 
     // Resolve the actual port (Crucial for port 0)
     struct sockaddr_storage ss;
-    socklen_t len = sizeof(ss);
-    if (getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
+    if (socklen_t len = sizeof(ss); getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
         return std::error_code(errno, std::system_category());
     }
 
@@ -186,8 +181,7 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
             }
         }
 
-        size_t len = m_msgHeaders[k].msg_len;
-        if (len > 0) {
+        if (size_t len = m_msgHeaders[k].msg_len; len > 0) {
             // Data is at the specific offset in the flat buffer
             uint8_t* packetData = m_cachedBasePtr + (k * m_alignedBufferSize);
             // Dispatch the packet to the user-defined handler
