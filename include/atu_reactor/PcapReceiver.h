@@ -77,6 +77,8 @@ class PcapReceiver : public PacketReceiver {
          */
         void step();
 
+        bool isFinished() const { return m_finished; }
+
         // Disable copy/move to strictly manage resource identity
         PcapReceiver(const PcapReceiver&) = delete;
         PcapReceiver& operator=(const PcapReceiver&) = delete;
@@ -117,6 +119,8 @@ class PcapReceiver : public PacketReceiver {
         std::vector<uint8_t> m_pendingPacketBuf;
         struct pcap_pkthdr m_pendingHeader;
         bool m_hasPending = false;
+
+        bool m_finished = false;
 };
 
 }  // namespace atu_reactor

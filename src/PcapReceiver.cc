@@ -34,7 +34,8 @@
 namespace atu_reactor {
 
 PcapReceiver::PcapReceiver(EventLoop& loopRef, PcapConfig config)
-        : PacketReceiver(loopRef, config), m_pcapConfig(config)
+        : PacketReceiver(loopRef, config), m_pcapConfig(config),
+        m_finished(false)
 {
 }
 
@@ -133,24 +134,36 @@ void PcapReceiver::processBatch() {
         return;
     }
 
-    struct pcap_pkthdr* header;
-    const uint8_t* packetData;
-    int count = 0;
+    int totalProcessedInThisTask = 0;
 
-    // In FLOOD mode, we process a full batch (e.g., 64 packets) then yield.
-    // In TIMED mode, we process packets until we hit a packet that is "in the future".
+    // High-performance threshold: Stay on CPU for 10k packets in FLOOD mode.
+    // In TIMED mode, we still respect the standard batchSize (default 64)
+    // and we process packets until we hit a packet that is "in the future".
+    const int stopLimit = (m_pcapConfig.mode == ReplayMode::FLOOD)
+        ? 10000
+        : m_pcapConfig.batchSize;
 
-    while (true) {
-        // Check batch limit (prevent starving other IO)
-        if (count >= m_config.batchSize) {
-            scheduleNext(); // Continue in next loop cycle
-            return;
-        }
+    // Check batch limit (prevent starving other IO)
+    while (totalProcessedInThisTask < stopLimit) {
+        struct pcap_pkthdr* header;
+        const uint8_t* packetData;
 
         // Read Packet
         int res = pcap_next_ex(m_pcapHandle, &header, &packetData);
-        if (res == -2) return; // EOF
-        if (res != 1) continue; // Error or timeout, retry
+        if (res != 1) {
+            // res == -2 is typical EOF from pcap_next_ex
+            // res == -1 is an error
+
+            // Log the event so you know why it stopped
+            if (res == -2) {
+                printf("\nPCAP EOF reached. Terminating loop...\n");
+                m_finished = true;
+            } else {
+                fprintf(stderr, "\nError reading packets: %s\n", pcap_geterr(m_pcapHandle));
+            }
+
+            return;
+        }
 
         // Timing Logic (TIMED Mode only)
         if (m_pcapConfig.mode == ReplayMode::TIMED) {
@@ -203,12 +216,12 @@ void PcapReceiver::processBatch() {
                     // We must copy the data because pcap internal buffer might change?
 
                     m_loop.runAfter(delay, [this]() {
-                        // Dispatch the delayed packet
-                        this->parseAndDispatch(&m_pendingHeader, m_pendingPacketBuf.data());
-                        this->m_hasPending = false;
-                        // Resume normal processing loop
-                        processBatch();
-                    });
+                            // Dispatch the delayed packet
+                            this->parseAndDispatch(&m_pendingHeader, m_pendingPacketBuf.data());
+                            this->m_hasPending = false;
+                            // Resume normal processing loop
+                            processBatch();
+                            });
                     return; // Return to event loop, waiting for timer
                 }
             }
@@ -216,8 +229,12 @@ void PcapReceiver::processBatch() {
 
         // Dispatch
         parseAndDispatch(header, packetData);
-        count++;
+        totalProcessedInThisTask++;
     }
+
+    // After processing the large flood block, yield to let the loop
+    // handle other events (like Ctrl+C signals).
+    scheduleNext();
 }
 
 void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet) {
@@ -260,12 +277,12 @@ void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint
     if (proto != ETHERTYPE_IP) return;
 
     // --- Layer 3: IPv4 ---
-    if (remaining < sizeof(struct ip)) return;
+    if (remaining < sizeof(struct ip)) [[unlikely]] return;
     auto* ip = reinterpret_cast<const struct ip*>(ptr);
     if (ip->ip_v != 4) return;
 
     uint32_t ipLen = ip->ip_hl * 4;
-    if (remaining < ipLen) return;
+    if (remaining < ipLen) [[unlikely]] return;
 
     if (ip->ip_p != IPPROTO_UDP) return;
 
@@ -273,19 +290,19 @@ void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint
     remaining -= ipLen;
 
     // --- Layer 4: UDP ---
-    if (remaining < sizeof(struct udphdr)) return;
+    if (remaining < sizeof(struct udphdr)) [[unlikely]] return;
     auto* udp = reinterpret_cast<const struct udphdr*>(ptr);
 
     uint16_t dstPort = ntohs(udp->uh_dport);
     uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
-    if (udpLen < sizeof(struct udphdr)) return;
+    if (udpLen < sizeof(struct udphdr)) [[unlikely]] return;
 
     size_t dataLen = udpLen - sizeof(struct udphdr);
 
     ptr += sizeof(struct udphdr);
     remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
 
-    if (remaining < dataLen) return;
+    if (remaining < dataLen) [[unlikely]] return;
 
     // --- Dispatch using m_hugeBuffer ---
     // Check if anyone subscribed to this port
