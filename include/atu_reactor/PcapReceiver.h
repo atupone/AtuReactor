@@ -21,9 +21,9 @@
 #include <atu_reactor/PacketReceiver.h>
 
 // System headers
-#include <pcap/pcap.h>
 #include <string>
 #include <unordered_map>
+#include <sys/types.h> // for off_t, size_t
 
 namespace atu_reactor {
 
@@ -38,6 +38,16 @@ struct PcapConfig : public ReceiverConfig {
     double speedMultiplier = 1.0; // 1.0 = normal speed, 2.0 = 2x speed
 };
 
+// Define our own PCAP Packet Header to replace <pcap.h>
+struct pcap_pkthdr {
+    struct {
+        uint32_t tv_sec;
+        uint32_t tv_usec;
+    } ts;
+    uint32_t caplen;
+    uint32_t len;
+};
+
 /**
  * @class PcapReceiver
  */
@@ -50,7 +60,7 @@ class PcapReceiver : public PacketReceiver {
          */
         explicit PcapReceiver(EventLoop& loop, PcapConfig config = {});
 
-        // Destructor ensures FDs are removed from the EventLoop before closing
+        // Destructor ensures munmap and close are called
         ~PcapReceiver() override;
 
         /**
@@ -73,9 +83,10 @@ class PcapReceiver : public PacketReceiver {
         void start();
 
         /**
-         * @brief Manually triggers the next packet (Only for STEP mode).
+         * @brief Manually triggers the next packet processing.
+         * @return true if a packet was processed, false if EOF or waiting (TIMED).
          */
-        void step();
+        bool step();
 
         bool isFinished() const { return m_finished; }
 
@@ -92,33 +103,32 @@ class PcapReceiver : public PacketReceiver {
         void handleRead(int, void*, PacketHandlerFn) override {}
 
     private:
-        void scheduleNext();
         void processBatch();
         void parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet);
 
+        // Helper to determine when a packet should be played in TIMED mode
+        std::chrono::steady_clock::time_point calculateTargetTime(const struct pcap_pkthdr* header);
+
         PcapConfig m_pcapConfig;
-        pcap_t* m_pcapHandle = nullptr;
-        char m_errbuf[PCAP_ERRBUF_SIZE];
+
+        // --- MMAP State ---
+        int m_fd = -1;
+        uint8_t* m_mappedData = nullptr;
+        size_t m_fileSize = 0;
+        const uint8_t* m_currentPtr = nullptr;
+        uint32_t m_linkType = 0;
 
         // Subscriptions: Map Port -> Handler info
         struct Subscription {
-            void* context;
-            PacketHandlerFn handler;
+            void* context = nullptr;
+            PacketHandlerFn handler = nullptr;
         };
-        std::unordered_map<uint16_t, Subscription> m_subscriptions;
+        std::unique_ptr<Subscription[]> m_portTable;
 
         // Timing state
         struct timespec m_pcapStartTs = {0, 0}; // TS of first packet in file
         std::chrono::steady_clock::time_point m_wallStartTs; // Wall time when replay started
         bool m_firstPacket = true;
-
-        uint32_t m_currentBatchIdx = 0; // Tracks which buffer slot to use
-        int m_linkType = -1; // Added to store DLT from pcap_datalink()
-
-        // Dedicated buffer for the "next" scheduled packet to avoid heap allocs
-        std::vector<uint8_t> m_pendingPacketBuf;
-        struct pcap_pkthdr m_pendingHeader;
-        bool m_hasPending = false;
 
         bool m_finished = false;
 };

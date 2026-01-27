@@ -20,41 +20,110 @@
 
 // System headers
 #include <cstring>
+#include <fcntl.h>
 #include <net/ethernet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <iostream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // Fallback for non-standard Linux headers
 #ifndef ETHERTYPE_VLAN
 #define ETHERTYPE_VLAN 0x8100
 #endif
 
+// Link Types
+#ifndef DLT_EN10MB
+#define DLT_EN10MB 1
+#endif
+#ifndef DLT_LINUX_SLL
+#define DLT_LINUX_SLL 113
+#endif
+
 namespace atu_reactor {
+
+// PCAP File Global Header
+struct pcap_file_header {
+    uint32_t magic_number;
+    uint16_t version_major;
+    uint16_t version_minor;
+    int32_t  thiszone;
+    uint32_t sigfigs;
+    uint32_t snaplen;
+    uint32_t network; // LinkType
+};
+
+// PCAP Packet Header (Disk Format)
+struct pcap_sf_pkthdr {
+    uint32_t ts_sec;
+    uint32_t ts_usec;
+    uint32_t caplen;
+    uint32_t len;
+};
 
 PcapReceiver::PcapReceiver(EventLoop& loopRef, PcapConfig config)
         : PacketReceiver(loopRef, config), m_pcapConfig(config),
+        m_portTable(std::make_unique<Subscription[]>(65536)),
         m_finished(false)
 {
 }
 
 PcapReceiver::~PcapReceiver() {
-    if (m_pcapHandle) {
-        pcap_close(m_pcapHandle);
+    if (m_mappedData && m_mappedData != MAP_FAILED) {
+        munmap(m_mappedData, m_fileSize);
+    }
+    if (m_fd >= 0) {
+        ::close(m_fd);
     }
 }
 
 Result<void> PcapReceiver::open(const std::string& path) {
     checkThread();
-    m_pcapHandle = pcap_open_offline(path.c_str(), m_errbuf);
-    if (!m_pcapHandle) {
-        // We simulate an IO error if pcap fails
-        return std::error_code(EIO, std::system_category());
+
+    // 1. Open File
+    m_fd = ::open(path.c_str(), O_RDONLY);
+    if (m_fd < 0) return std::error_code(errno, std::system_category());
+
+    // 2. Get Size
+    struct stat st;
+    if (fstat(m_fd, &st) < 0) {
+        ::close(m_fd);
+        m_fd = -1;
+        return std::error_code(errno, std::system_category());
+    }
+    m_fileSize = st.st_size;
+
+    // 3. Map into Memory
+    void* mapped = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
+    if (mapped == MAP_FAILED) {
+        ::close(m_fd);
+        m_fd = -1;
+        return std::error_code(errno, std::system_category());
     }
 
-    // Capture the link type (e.g., DLT_EN10MB or DLT_LINUX_SLL)
-    m_linkType = pcap_datalink(m_pcapHandle);
+    // Convert to uint8_t* for arithmetic
+    m_mappedData = static_cast<uint8_t*>(mapped);
+    madvise(m_mappedData, m_fileSize, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+    // 4. Parse Global Header (24 bytes)
+    if (m_fileSize < sizeof(pcap_file_header)) {
+        return std::error_code(EINVAL, std::system_category());
+    }
+
+    auto* g_hdr = reinterpret_cast<const pcap_file_header*>(m_mappedData);
+
+    // Check magic number for byte swapping
+    if (g_hdr->magic_number == 0xd4c3b2a1 || g_hdr->magic_number == 0x4d3c2b1a) {
+        m_linkType = __builtin_bswap32(g_hdr->network);
+    } else {
+        m_linkType = g_hdr->network;
+    }
+
+    // Set cursor to start of first packet
+    m_currentPtr = m_mappedData + sizeof(pcap_file_header);
 
     return Result<void>::success();
 }
@@ -69,8 +138,7 @@ Result<int> PcapReceiver::subscribe(uint16_t port,
     }
 
     // Perform PcapReceiver specific registration.
-    // We store the handler in our map so the parser can find it.
-    m_subscriptions[port] = {context, handler};
+    m_portTable[port] = {context, handler};
 
     // Return the port as the ID.
     // This allows the caller to treat the port as the 'handle' for this subscription.
@@ -83,17 +151,13 @@ Result<void> PcapReceiver::unsubscribe(uint16_t port) {
         return baseResult;
     }
 
-    if (m_subscriptions.erase(port) == 0) {
-        return std::error_code(ENOENT, std::system_category());
-    }
+    m_portTable[port] = {};
     return Result<void>::success();
 }
 
 void PcapReceiver::start() {
     checkThread();
-    if (!m_pcapHandle) {
-        return;
-    }
+    if (!m_mappedData) return;
 
     m_firstPacket = true;
 
@@ -103,138 +167,111 @@ void PcapReceiver::start() {
     }
 
     // For TIMED or FLOOD, schedule the first batch immediately
-    scheduleNext();
-}
-
-void PcapReceiver::step() {
-    checkThread();
-    if (m_pcapConfig.mode != ReplayMode::STEP) {
-        return;
-    }
-
-    // Process exactly one packet
-    struct pcap_pkthdr* header;
-    const uint8_t* packetData;
-    int res = pcap_next_ex(m_pcapHandle, &header, &packetData);
-
-    if (res == 1) {
-        parseAndDispatch(header, packetData);
-    }
-}
-
-void PcapReceiver::scheduleNext() {
-    // We yield to the reactor loop to process other IO/Timers
     m_loop.runAfter(std::chrono::milliseconds(0), [this]() {
         processBatch();
     });
 }
 
-void PcapReceiver::processBatch() {
-    if (!m_pcapHandle || m_hasPending) {
-        return;
+// The core logic: Reads one packet from memory
+bool PcapReceiver::step() {
+    checkThread();
+
+    // EOF Check
+    if (m_currentPtr + sizeof(pcap_sf_pkthdr) > m_mappedData + m_fileSize) {
+        m_finished = true;
+        printf("\nPCAP EOF reached.\n");
+        return false;
     }
 
-    int totalProcessedInThisTask = 0;
+    // Pointer to Packet Header on Disk
+    auto* disk_hdr = reinterpret_cast<const pcap_sf_pkthdr*>(m_currentPtr);
 
-    // High-performance threshold: Stay on CPU for 10k packets in FLOOD mode.
-    // In TIMED mode, we still respect the standard batchSize (default 64)
-    // and we process packets until we hit a packet that is "in the future".
+    // Create a compatible in-memory header
+    struct pcap_pkthdr h;
+    h.ts.tv_sec = disk_hdr->ts_sec;
+    h.ts.tv_usec = disk_hdr->ts_usec;
+    h.caplen = disk_hdr->caplen;
+    h.len = disk_hdr->len;
+
+    // TIMED Mode Check: Is it too early?
+    if (m_pcapConfig.mode == ReplayMode::TIMED) {
+        auto targetTime = calculateTargetTime(&h);
+        auto now = std::chrono::steady_clock::now();
+
+        if (targetTime > now) {
+            // It's in the future.
+            // We return FALSE so the loop stops, but we DO NOT advance m_currentPtr.
+            // We reschedule the loop to wake up at targetTime.
+            auto delay = std::chrono::duration_cast<Duration>(targetTime - now);
+            m_loop.runAfter(delay, [this]() {
+                this->processBatch();
+            });
+            return false;
+        }
+    }
+
+    // Packet Data starts immediately after header
+    const uint8_t* packet_data = m_currentPtr + sizeof(pcap_sf_pkthdr);
+
+    // Dispatch
+    parseAndDispatch(&h, packet_data);
+
+    // Advance Cursor
+    m_currentPtr = packet_data + disk_hdr->caplen;
+    return true;
+}
+
+void PcapReceiver::processBatch() {
+    if (!m_mappedData || m_finished) return;
+
+    int totalProcessed = 0;
     const int stopLimit = (m_pcapConfig.mode == ReplayMode::FLOOD)
-        ? 10000
-        : m_pcapConfig.batchSize;
+                          ? 10000
+                          : m_pcapConfig.batchSize;
 
-    // Check batch limit (prevent starving other IO)
-    while (totalProcessedInThisTask < stopLimit) {
-        struct pcap_pkthdr* header;
-        const uint8_t* packetData;
-
-        // Read Packet
-        int res = pcap_next_ex(m_pcapHandle, &header, &packetData);
-        if (res != 1) {
-            // res == -2 is typical EOF from pcap_next_ex
-            // res == -1 is an error
-
-            // Log the event so you know why it stopped
-            if (res == -2) {
-                printf("\nPCAP EOF reached. Terminating loop...\n");
-                m_finished = true;
-            } else {
-                fprintf(stderr, "\nError reading packets: %s\n", pcap_geterr(m_pcapHandle));
-            }
-
+    while (totalProcessed < stopLimit) {
+        // step() returns false if EOF or if we are waiting for time
+        if (!step()) {
             return;
         }
-
-        // Timing Logic (TIMED Mode only)
-        if (m_pcapConfig.mode == ReplayMode::TIMED) {
-            if (m_firstPacket) {
-                m_pcapStartTs.tv_sec = header->ts.tv_sec;
-                m_pcapStartTs.tv_nsec = static_cast<long>(header->ts.tv_usec) * 1000;
-                m_wallStartTs = std::chrono::steady_clock::now();
-                m_firstPacket = false;
-            } else {
-                // Calculate Offset from start of PCAP
-                long diff_sec = header->ts.tv_sec - m_pcapStartTs.tv_sec;
-                long diff_ns = (static_cast<long>(header->ts.tv_usec) * 1000)
-                    - m_pcapStartTs.tv_nsec;
-
-                // Adjust for speed multiplier
-                if (m_pcapConfig.speedMultiplier != 1.0) {
-                    double total_ns = (double)diff_sec * 1e9 + (double)diff_ns;
-                    total_ns /= m_pcapConfig.speedMultiplier;
-                    diff_sec = (long)(total_ns / 1e9);
-                    diff_ns = (long)((long long)total_ns % 1000000000L);
-                }
-
-                auto targetTime = m_wallStartTs
-                    + std::chrono::seconds(diff_sec)
-                    + std::chrono::nanoseconds(diff_ns);
-                auto now = std::chrono::steady_clock::now();
-
-                if (targetTime > now) {
-                    // ZERO HEAP ALLOCATION:
-                    // Ensure internal buffer is large enough (no-op after first few packets)
-                    if (m_pendingPacketBuf.capacity() < header->caplen) {
-                        m_pendingPacketBuf.reserve(header->caplen);
-                    }
-
-                    // Copy data into reusable member memory
-                    m_pendingPacketBuf.assign(packetData, packetData + header->caplen);
-                    m_pendingHeader = *header;
-                    m_hasPending = true;
-
-                    // This packet is in the future.
-                    // We cannot process it yet. We must sleep (schedule timer) and retry.
-                    // Note: pcap_next_ex ALREADY advanced the pointer. This is tricky.
-                    // We must process THIS packet when the timer fires.
-                    // Since we can't "put back" the packet easily, we execute the dispatch logic
-                    // inside a delayed lambda.
-
-                    auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(targetTime - now);
-
-                    // Capture the necessary data for THIS packet to run later
-                    // We must copy the data because pcap internal buffer might change?
-
-                    m_loop.runAfter(delay, [this]() {
-                            // Dispatch the delayed packet
-                            this->parseAndDispatch(&m_pendingHeader, m_pendingPacketBuf.data());
-                            this->m_hasPending = false;
-                            // Resume normal processing loop
-                            processBatch();
-                            });
-                    return; // Return to event loop, waiting for timer
-                }
-            }
-        }
-
-        // Dispatch
-        parseAndDispatch(header, packetData);
-        totalProcessedInThisTask++;
+        totalProcessed++;
     }
 
-    // After processing the large flood block, yield to let the loop
-    // handle other events (like Ctrl+C signals).
-    scheduleNext();
+    // Yield to event loop if we are just flooding (avoid freezing the app)
+    if (m_pcapConfig.mode == ReplayMode::FLOOD && !m_finished) {
+        m_loop.runAfter(Duration(0), [this]() {
+            this->processBatch();
+        });
+    }
+    // Note: In TIMED mode, step() handles the rescheduling when it hits a future packet.
+    // If the batch finished but next packet is valid (catch-up scenario), schedule immediate continuation.
+    else if (m_pcapConfig.mode == ReplayMode::TIMED && !m_finished) {
+         m_loop.runAfter(Duration(0), [this]() {
+            this->processBatch();
+        });
+    }
+}
+
+std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTime(const struct pcap_pkthdr* header) {
+    if (m_firstPacket) {
+        m_pcapStartTs.tv_sec = header->ts.tv_sec;
+        m_pcapStartTs.tv_nsec = static_cast<long>(header->ts.tv_usec) * 1000;
+        m_wallStartTs = std::chrono::steady_clock::now();
+        m_firstPacket = false;
+        return m_wallStartTs;
+    }
+
+    long diff_sec = header->ts.tv_sec - m_pcapStartTs.tv_sec;
+    long diff_ns = (static_cast<long>(header->ts.tv_usec) * 1000) - m_pcapStartTs.tv_nsec;
+
+    if (m_pcapConfig.speedMultiplier != 1.0) {
+        double total_ns = (double)diff_sec * 1e9 + (double)diff_ns;
+        total_ns /= m_pcapConfig.speedMultiplier;
+        diff_sec = (long)(total_ns / 1e9);
+        diff_ns = (long)((long long)total_ns % 1000000000L);
+    }
+
+    return m_wallStartTs + std::chrono::seconds(diff_sec) + std::chrono::nanoseconds(diff_ns);
 }
 
 void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet) {
@@ -244,8 +281,8 @@ void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint
     uint32_t remaining = header->caplen;
     uint16_t proto = 0;
 
-    // --- Layer 2: Dynamic Decapsulation ---
-    if (m_linkType == 113) { // DLT_LINUX_SLL (Linux Cooked)
+    // --- Layer 2 ---
+    if (m_linkType == DLT_LINUX_SLL) {
         if (remaining < 16) return;
         // Protocol is at offset 14 (big endian)
         proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 14));
@@ -304,31 +341,19 @@ void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint
 
     if (remaining < dataLen) [[unlikely]] return;
 
-    // --- Dispatch using m_hugeBuffer ---
-    // Check if anyone subscribed to this port
-    auto it = m_subscriptions.find(dstPort);
-    if (it != m_subscriptions.end()) {
-        // Determine destination in our pre-allocated hugepage memory
-        // We use m_currentBatchIdx to simulate the same buffer layout as UDPReceiver
-        uint8_t* destBuf = m_cachedBasePtr + (m_currentBatchIdx * m_alignedBufferSize);
-
-        // Safety check: Ensure the packet fits in the allocated buffer slot
-        size_t copyLen = std::min(dataLen, (size_t)m_config.bufferSize);
-
-        // Perform the copy (This provides the user with a mutable pointer)
-        std::memcpy(destBuf, ptr, copyLen);
-
+    // --- Dispatch ---
+    auto& sub = m_portTable[dstPort];
+    if (sub.handler) {
         struct timespec ts;
         ts.tv_sec = header->ts.tv_sec;
         ts.tv_nsec = header->ts.tv_usec * 1000;
 
-        // Dispatch using the managed buffer
-        // Call the user handler directly
-        // Note: PacketStatus is OK because we dropped truncated frames earlier
-        it->second.handler(it->second.context, destBuf, copyLen, PacketStatus::OK, ts);
-
-        // Increment and wrap the buffer index
-        m_currentBatchIdx = (m_currentBatchIdx + 1) % m_config.batchSize;
+        sub.handler(
+                sub.context,
+                const_cast<uint8_t*>(ptr),
+                dataLen,
+                PacketStatus::OK,
+                ts);
     }
 }
 
