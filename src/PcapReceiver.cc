@@ -251,7 +251,7 @@ bool PcapReceiver::step() {
     parseAndDispatch(ts, caplen, len, packet_data);
 
     // Advance Cursor
-    m_currentPtr = packet_data + disk_hdr->caplen;
+    m_currentPtr = packet_data + caplen;
     return true;
 }
 
