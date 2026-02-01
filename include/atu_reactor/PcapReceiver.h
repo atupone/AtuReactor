@@ -104,10 +104,14 @@ class PcapReceiver : public PacketReceiver {
 
     private:
         void processBatch();
-        void parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet);
+        void parseAndDispatch(
+                const struct timespec & header,
+                uint32_t caplen,
+                uint32_t len,
+                const uint8_t* packet);
 
         // Helper to determine when a packet should be played in TIMED mode
-        std::chrono::steady_clock::time_point calculateTargetTime(const struct pcap_pkthdr* header);
+        std::chrono::steady_clock::time_point calculateTargetTimeHighRes(const struct timespec& header);
 
         PcapConfig m_pcapConfig;
 
@@ -131,6 +135,9 @@ class PcapReceiver : public PacketReceiver {
         bool m_firstPacket = true;
 
         bool m_finished = false;
+
+        bool m_swapped = false;
+        bool m_isNanosecond = false;
 };
 
 }  // namespace atu_reactor

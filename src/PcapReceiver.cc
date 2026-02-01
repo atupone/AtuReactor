@@ -115,8 +115,22 @@ Result<void> PcapReceiver::open(const std::string& path) {
 
     auto* g_hdr = reinterpret_cast<const pcap_file_header*>(m_mappedData);
 
+    // Detect format based on Magic Number
+    if (g_hdr->magic_number == 0xd4c3b2a1) {
+        m_swapped = true;
+        m_isNanosecond = false;
+    } else if (g_hdr->magic_number == 0x4d3c2b1a) {
+        m_swapped = true;
+        m_isNanosecond = true;
+    } else if (g_hdr->magic_number == 0xa1b23c4d) {
+        m_swapped = false;
+        m_isNanosecond = true;
+    } else {
+        m_swapped = false;
+        m_isNanosecond = false;
+    }
     // Check magic number for byte swapping
-    if (g_hdr->magic_number == 0xd4c3b2a1 || g_hdr->magic_number == 0x4d3c2b1a) {
+    if (m_swapped) {
         m_linkType = __builtin_bswap32(g_hdr->network);
     } else {
         m_linkType = g_hdr->network;
@@ -186,16 +200,35 @@ bool PcapReceiver::step() {
     // Pointer to Packet Header on Disk
     auto* disk_hdr = reinterpret_cast<const pcap_sf_pkthdr*>(m_currentPtr);
 
+    // Read and potentially swap fields
+    uint32_t sec
+        = m_swapped
+        ? __builtin_bswap32(disk_hdr->ts_sec)
+        : disk_hdr->ts_sec;
+    uint32_t fraction
+        = m_swapped
+        ? __builtin_bswap32(disk_hdr->ts_usec)
+        : disk_hdr->ts_usec;
+    uint32_t caplen
+        = m_swapped
+        ? __builtin_bswap32(disk_hdr->caplen)
+        : disk_hdr->caplen;
+    uint32_t len
+        = m_swapped
+        ? __builtin_bswap32(disk_hdr->len)
+        : disk_hdr->len;
+
     // Create a compatible in-memory header
-    struct pcap_pkthdr h;
-    h.ts.tv_sec = disk_hdr->ts_sec;
-    h.ts.tv_usec = disk_hdr->ts_usec;
-    h.caplen = disk_hdr->caplen;
-    h.len = disk_hdr->len;
+    struct timespec ts;
+    ts.tv_sec = sec;
+    ts.tv_nsec = static_cast<long>(fraction);
+    if (!m_isNanosecond) {
+        ts.tv_nsec *= 1000;
+    }
 
     // TIMED Mode Check: Is it too early?
     if (m_pcapConfig.mode == ReplayMode::TIMED) {
-        auto targetTime = calculateTargetTime(&h);
+        auto targetTime = calculateTargetTimeHighRes(ts);
         auto now = std::chrono::steady_clock::now();
 
         if (targetTime > now) {
@@ -213,8 +246,9 @@ bool PcapReceiver::step() {
     // Packet Data starts immediately after header
     const uint8_t* packet_data = m_currentPtr + sizeof(pcap_sf_pkthdr);
 
-    // Dispatch
-    parseAndDispatch(&h, packet_data);
+    // Dispatch with precision
+    // Passing caplen and len explicitly since we've already handled their endianness
+    parseAndDispatch(ts, caplen, len, packet_data);
 
     // Advance Cursor
     m_currentPtr = packet_data + disk_hdr->caplen;
@@ -252,17 +286,24 @@ void PcapReceiver::processBatch() {
     }
 }
 
-std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTime(const struct pcap_pkthdr* header) {
+std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
+        const struct timespec& ts)
+{
     if (m_firstPacket) {
-        m_pcapStartTs.tv_sec = header->ts.tv_sec;
-        m_pcapStartTs.tv_nsec = static_cast<long>(header->ts.tv_usec) * 1000;
+        m_pcapStartTs = ts;
         m_wallStartTs = std::chrono::steady_clock::now();
         m_firstPacket = false;
         return m_wallStartTs;
     }
 
-    long diff_sec = header->ts.tv_sec - m_pcapStartTs.tv_sec;
-    long diff_ns = (static_cast<long>(header->ts.tv_usec) * 1000) - m_pcapStartTs.tv_nsec;
+    long diff_sec = ts.tv_sec  - m_pcapStartTs.tv_sec;
+    long diff_ns  = ts.tv_nsec - m_pcapStartTs.tv_nsec;
+
+    // Normalize nanoseconds if negative (e.g., ts.tv_nsec < start.tv_nsec)
+    if (diff_ns < 0) {
+        diff_sec -= 1;
+        diff_ns += 1000000000L;
+    }
 
     if (m_pcapConfig.speedMultiplier != 1.0) {
         double total_ns = (double)diff_sec * 1e9 + (double)diff_ns;
@@ -274,11 +315,16 @@ std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTime(const st
     return m_wallStartTs + std::chrono::seconds(diff_sec) + std::chrono::nanoseconds(diff_ns);
 }
 
-void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint8_t* packet) {
-    if (header->caplen != header->len) return; // Ignore truncated in capture
+void PcapReceiver::parseAndDispatch(
+        const struct timespec& ts,
+        uint32_t caplen,
+        uint32_t len,
+        const uint8_t* packet)
+{
+    if (caplen != len) return; // Ignore truncated in capture
 
     const uint8_t* ptr = packet;
-    uint32_t remaining = header->caplen;
+    uint32_t remaining = caplen;
     uint16_t proto = 0;
 
     // --- Layer 2 ---
@@ -344,10 +390,6 @@ void PcapReceiver::parseAndDispatch(const struct pcap_pkthdr* header, const uint
     // --- Dispatch ---
     auto& sub = m_portTable[dstPort];
     if (sub.handler) {
-        struct timespec ts;
-        ts.tv_sec = header->ts.tv_sec;
-        ts.tv_nsec = header->ts.tv_usec * 1000;
-
         sub.handler(
                 sub.context,
                 const_cast<uint8_t*>(ptr),
