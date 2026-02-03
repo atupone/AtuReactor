@@ -19,7 +19,6 @@
 #include <atu_reactor/PacketReceiver.h>
 
 // System headers
-#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -132,12 +131,6 @@ Result<void> PacketReceiver::unsubscribe(uint16_t port) {
 
     // Return the loop result (or success if we don't care about epoll_ctl DEL errors)
     return loopRes;
-}
-
-// Enforce the thread-hostile requirement
-void PacketReceiver::checkThread() const {
-    assert(std::this_thread::get_id() == m_ownerThreadId &&
-           "PacketReceiver accessed from wrong thread!");
 }
 
 void PacketReceiver::dispatch(int n, const PacketMetadata* meta, PacketHandlerFn handler, void* context) {

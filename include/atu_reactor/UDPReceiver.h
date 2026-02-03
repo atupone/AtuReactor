@@ -22,8 +22,11 @@
 
 // System headers
 #include <netinet/in.h>
-#include <sys/socket.h>
 #include <vector>
+#include <sys/socket.h>
+
+// Library headers
+#include <atu_reactor/Export.h>
 
 namespace atu_reactor {
 
@@ -35,7 +38,7 @@ namespace atu_reactor {
  * including subscription and the eventual EventLoop::runOnce() dispatch,
  * MUST be executed on the same thread.
  */
-class UDPReceiver : public PacketReceiver {
+class ATU_API UDPReceiver : public PacketReceiver {
     // Grant EventLoop access to private members like handleRead
     friend class EventLoop;
 

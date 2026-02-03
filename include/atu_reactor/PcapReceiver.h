@@ -23,7 +23,10 @@
 // System headers
 #include <string>
 #include <unordered_map>
-#include <sys/types.h> // for off_t, size_t
+#include <sys/types.h>
+
+// Library headers
+#include <atu_reactor/Export.h>
 
 namespace atu_reactor {
 
@@ -51,7 +54,7 @@ struct pcap_pkthdr {
 /**
  * @class PcapReceiver
  */
-class PcapReceiver : public PacketReceiver {
+class ATU_API PcapReceiver : public PacketReceiver {
     public:
         /**
          * @brief Constructor
@@ -68,6 +71,8 @@ class PcapReceiver : public PacketReceiver {
          * @param path Path to the .pcap file.
          */
         [[nodiscard]] Result<void> open(const std::string& path);
+
+        void rewind();
 
         /**
          * @brief "Subscribes" to a specific destination port found in the PCAP.

@@ -142,6 +142,14 @@ Result<void> PcapReceiver::open(const std::string& path) {
     return Result<void>::success();
 }
 
+void PcapReceiver::rewind() {
+    checkThread();
+    // Move cursor back to the start of the first packet, right after global header
+    m_currentPtr = m_mappedData + sizeof(pcap_file_header);
+    m_finished = false;
+    m_firstPacket = true;
+}
+
 Result<int> PcapReceiver::subscribe(uint16_t port,
                                     void* context,
                                     PacketHandlerFn handler) {
@@ -193,7 +201,6 @@ bool PcapReceiver::step() {
     // EOF Check
     if (m_currentPtr + sizeof(pcap_sf_pkthdr) > m_mappedData + m_fileSize) {
         m_finished = true;
-        printf("\nPCAP EOF reached.\n");
         return false;
     }
 

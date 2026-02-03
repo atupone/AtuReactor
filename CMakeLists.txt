@@ -49,12 +49,16 @@ add_compile_options(
     -Wconversion
     -Wshadow
     -Wnon-virtual-dtor
-    -ggdb -O2
+    -ggdb -O3 -march=native
 )
 
 if(STRICT_WERROR)
     add_compile_options(-Werror)
 endif()
+
+# This tells the compiler NOT to export symbols unless explicitly marked
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 # ---------------------------------------------------------------------------
 # THE LIBRARY
@@ -67,6 +71,23 @@ add_library(AtuReactor SHARED
 )
 
 add_library(AtuReactor::AtuReactor ALIAS AtuReactor)
+
+set_target_properties(AtuReactor PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+
+if(NOT MSVC)
+    # Resolve symbols within the lib (removes lookup overhead)
+    target_link_options(AtuReactor PRIVATE "-Wl,-Bsymbolic")
+    target_link_options(AtuReactor PRIVATE "-Wl,-Bsymbolic-functions")
+
+    # Force resolution at startup (removes runtime PLT overhead)
+    target_link_options(AtuReactor PRIVATE "-Wl,-z,now")
+
+    # Use the fastest hash style available
+    target_link_options(AtuReactor PRIVATE "-Wl,--hash-style=gnu")
+endif()
 
 # Define include directories for the library
 target_include_directories(AtuReactor PUBLIC
@@ -150,6 +171,8 @@ if(BUILD_EXAMPLES)
     # 4. pcap replay
     add_executable(pcap_replay.cc examples/pcap_replay.cc)
     target_link_libraries(pcap_replay.cc PRIVATE AtuReactor)
+
+    target_link_options(pcap_replay.cc PRIVATE "-Wl,-z,now" "-Wl,-Bsymbolic")
 
     message(STATUS "Example programs are enabled")
 else()

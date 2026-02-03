@@ -18,6 +18,7 @@
 #pragma once
 
 // System headers
+#include <cassert>
 #include <map>
 #include <sys/socket.h>
 #include <thread>
@@ -45,7 +46,7 @@ struct ReceiverConfig {
  * @class PacketReceiver
  * @brief Abstract base managing shared memory and thread-hostile state.
  */
-class PacketReceiver {
+class ATU_API PacketReceiver {
     // Grant EventLoop access to private members like handleRead
     friend class EventLoop;
 
@@ -81,7 +82,10 @@ class PacketReceiver {
         /**
          * @brief Enforces the thread-hostile requirement.
          */
-        void checkThread() const;
+        inline void checkThread() const {
+            assert(std::this_thread::get_id() == m_ownerThreadId &&
+                    "PacketReceiver accessed from wrong thread!");
+        }
 
         /**
          * @brief Internal callback triggered by EventLoop when a socket has data.
