@@ -41,14 +41,61 @@ struct PcapConfig : public ReceiverConfig {
     double speedMultiplier = 1.0; // 1.0 = normal speed, 2.0 = 2x speed
 };
 
-// Define our own PCAP Packet Header to replace <pcap.h>
-struct pcap_pkthdr {
-    struct {
-        uint32_t tv_sec;
-        uint32_t tv_usec;
-    } ts;
+// PCAP File Global Header
+struct pcap_file_header {
+    uint32_t magic_number;
+    uint16_t version_major;
+    uint16_t version_minor;
+    int32_t  thiszone;
+    uint32_t sigfigs;
+    uint32_t snaplen;
+    uint32_t network; // LinkType
+};
+
+enum PcapMagic : uint32_t {
+    // Legacy PCAP
+    MAGIC_MICRO_BE = 0xa1b2c3d4,
+    MAGIC_MICRO_LE = 0xd4c3b2a1,
+    MAGIC_NANO_BE  = 0xa1b23c4d,
+    MAGIC_NANO_LE  = 0x4d3c2b1a,
+
+    // PCAPNG
+    MAGIC_PCAPNG_SHB = 0x0A0D0D0A,
+    PCAPNG_BOM       = 0x1A2B3C4D,
+    PCAPNG_BOM_SWAP  = 0x4D3C2B1A,
+    PCAPNG_IDB       = 0x00000001,
+    PCAPNG_EPB       = 0x00000006
+};
+
+// PCAP Packet Header (Disk Format)
+struct pcap_sf_pkthdr {
+    uint32_t ts_sec;
+    uint32_t ts_usec;
     uint32_t caplen;
     uint32_t len;
+};
+
+struct PcapNgBlockHeader {
+    uint32_t type;
+    uint32_t totalLength;
+};
+
+struct PcapNgIDBBody {
+    uint16_t linkType;
+    uint16_t reserved;
+    uint32_t snapLen;
+};
+
+// Body of an Enhanced Packet Block (Type 6)
+struct PcapNgEPBBody {
+    uint32_t interfaceId;
+    uint32_t timestampHigh;
+    uint32_t timestampLow;
+    uint32_t capLen;
+    uint32_t origLen;
+    // Packet Data follows immediately...
+    // Padding to 32-bit boundary...
+    // Total Length (repeated)
 };
 
 /**
@@ -113,10 +160,19 @@ class ATU_API PcapReceiver : public PacketReceiver {
                 const struct timespec & header,
                 uint32_t caplen,
                 uint32_t len,
-                const uint8_t* packet);
+                const uint8_t* packet,
+                uint32_t linkType);
 
         // Helper to determine when a packet should be played in TIMED mode
         std::chrono::steady_clock::time_point calculateTargetTimeHighRes(const struct timespec& header);
+
+        // Helper to read NG blocks
+        bool stepPcapNg();
+
+        struct InterfaceInfo {
+            uint16_t linkType;
+            uint64_t tsResolutionDivisor;
+        };
 
         PcapConfig m_pcapConfig;
 
@@ -143,6 +199,12 @@ class ATU_API PcapReceiver : public PacketReceiver {
 
         bool m_swapped = false;
         bool m_isNanosecond = false;
+
+        // Maps Interface ID (index in file) to its metadata
+        std::unordered_map<uint32_t, InterfaceInfo> m_interfaces;
+        uint32_t m_interfaceCount = 0;
+
+        bool m_isPcapNg = true;
 };
 
 }  // namespace atu_reactor
