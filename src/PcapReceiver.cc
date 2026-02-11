@@ -120,6 +120,8 @@ Result<void> PcapReceiver::open(const std::string& path) {
 
         // Start reading immediately after the pointer (will be handled by stepPcapNg)
     } else {
+        m_isPcapNg = false;
+
         if (g_hdr->magic_number == MAGIC_MICRO_LE) {
             m_swapped = true;
             m_isNanosecond = false;
