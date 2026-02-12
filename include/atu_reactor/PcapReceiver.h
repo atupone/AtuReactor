@@ -156,6 +156,7 @@ class ATU_API PcapReceiver : public PacketReceiver {
 
     private:
         void processBatch();
+        void processBatchFlood();
         void parseAndDispatch(
                 const struct timespec & header,
                 uint32_t caplen,

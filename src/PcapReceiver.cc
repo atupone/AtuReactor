@@ -385,6 +385,11 @@ bool PcapReceiver::stepPcapNg() {
 void PcapReceiver::processBatch() {
     if (!m_mappedData || m_finished) return;
 
+    // Dispatch to optimized loop for the flood case
+    if (m_pcapConfig.mode == ReplayMode::FLOOD) {
+        processBatchFlood();
+    }
+
     int totalProcessed = 0;
     const int stopLimit = (m_pcapConfig.mode == ReplayMode::FLOOD)
                           ? 10000
@@ -418,6 +423,34 @@ void PcapReceiver::processBatch() {
         });
     }
 }
+
+void PcapReceiver::processBatchFlood() {
+    int totalProcessed = 0;
+    const int stopLimit = 10000;
+
+    while (totalProcessed < stopLimit) {
+        // We prefetch ~128 bytes ahead of the current pointer.
+        // This usually covers the next packet's Pcap header and Layer 2/3 headers.
+        if (m_currentPtr + 128 < m_mappedData + m_fileSize) {
+            __builtin_prefetch(m_currentPtr + 128, 0, 3);
+        }
+
+        // step() returns false if EOF or if we are waiting for time
+        if (!step()) {
+            return;
+        }
+        totalProcessed++;
+    }
+    if (m_finished) {
+        return;
+    }
+
+    m_loop.runInLoop([this]() {
+        this->processBatchFlood();
+    });
+}
+
+
 
 std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
         const struct timespec& ts)
