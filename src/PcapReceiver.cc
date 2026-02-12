@@ -78,7 +78,7 @@ Result<void> PcapReceiver::open(const std::string& path) {
     m_fileSize = st.st_size;
 
     // 3. Map into Memory
-    void* mapped = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
+    void* mapped = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE | MAP_POPULATE, m_fd, 0);
     if (mapped == MAP_FAILED) {
         ::close(m_fd);
         m_fd = -1;
