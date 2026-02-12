@@ -448,6 +448,12 @@ std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
     return m_wallStartTs + std::chrono::seconds(diff_sec) + std::chrono::nanoseconds(diff_ns);
 }
 
+// This is portable AND fast because the compiler optimizes the array access
+inline bool isFastPathIPv4(const uint8_t* p) {
+    // p+12 is EtherType, p+14 is IP Version
+    return p[12] == 0x08 && p[13] == 0x00 && (p[14] & 0xF0) == 0x40;
+}
+
 void PcapReceiver::parseAndDispatch(
         const struct timespec& ts,
         uint32_t caplen,
@@ -455,41 +461,63 @@ void PcapReceiver::parseAndDispatch(
         const uint8_t* packet,
         uint32_t linkType)
 {
-    // The Super-Branch: LinkType, Integrity (caplen==len), and Min Length (42)
-    if (linkType == DLT_EN10MB && caplen == len && caplen >= 42) [[likely]] {
+    // Determine status: If captured length < original length, it's truncated
+    PacketStatus status = (caplen < len) ? PacketStatus::TRUNCATED : PacketStatus::OK;
 
-        // Load 8 bytes from EtherType offset (12)
-        // This includes EtherType(2), Ver/IHL(1), TOS(1), TotalLen(2), ID(2)
-        uint64_t headerSlice = *reinterpret_cast<const uint64_t*>(packet + 12);
+    // Validate Link Type (Done once during init, but used here)
+    // If m_linkType != 1 (Mapping to DLT_EN10MB), we MUST use slow path.
+    if (m_linkType == DLT_EN10MB && status == PacketStatus::OK && caplen >= 42) [[likely]] {
+        // The FAST PATH
+        if (isFastPathIPv4(packet) && packet[23] == IPPROTO_UDP) [[likely]] {
+            // NOW we need IHL to find the start of the UDP header
+            // We only do this math because we KNOW we want this packet.
+            uint8_t ihl = packet[14] & 0x0F;
+            uint32_t ipHeaderLen = ihl << 2;
+            uint32_t totalHeaderLen = 14 + ipHeaderLen + 8; // Eth + IP + UDP
 
-        // Mask: Check EtherType is IPv4 (0x0800) and IP Ver/IHL is 0x45
-        // Mask: 0x0000000000FF0000FFFF (Little Endian logic for the load)
-        if ((headerSlice & 0x0000000000FF0000FFFF) == 0x00000000004500000800) [[likely]] {
-
-            // Verify Protocol is UDP (Offset 23 is 11 bytes after MACs)
-            if (packet[23] == IPPROTO_UDP) [[likely]] {
-                auto* udp = reinterpret_cast<const struct udphdr*>(packet + 34);
-
-                // Optimized Network-Order Port Table lookup
-                uint16_t dstPortNet = udp->uh_dport;
-                uint16_t udpLen = ntohs(udp->uh_ulen);
-
-                if (dstPortNet == m_hotPort && m_hotHandler != nullptr) [[likely]] {
-                    m_hotHandler(m_hotContext, packet + 42, udpLen - 8, PacketStatus::OK, ts);
-                } else {
-                    auto& sub = m_portTable[dstPortNet];
-                    if (sub.handler) {
-                        // Update hot port for the next time
-                        m_hotPort = dstPortNet;
-                        m_hotHandler = sub.handler;
-                        m_hotContext = sub.context;
-
-                        // Standard UDP header is 8 bytes
-                        sub.handler(sub.context, packet + 42, udpLen - 8, PacketStatus::OK, ts);
-                    }
-                }
-                return; // Fast path successful
+            if (caplen < totalHeaderLen) [[unlikely]] {
+                // Cannot read the udp header
+                return;
             }
+
+            // Map the UDP header relative to the actual end of the IP header
+            auto* udp = reinterpret_cast<const struct udphdr*>(packet + 14 + ipHeaderLen);
+
+            // Optimized Network-Order Port Table lookup
+            uint16_t dstPortNet = udp->uh_dport;
+
+            // CHECK PORT FIRST
+            if (dstPortNet != m_hotPort || m_hotHandler == nullptr) [[unlikely]] {
+                // Cache Miss or First Packet: Look up the port in our table
+                auto& sub = m_portTable[dstPortNet];
+
+                if (!sub.handler) {
+                    return; // No subscription for this port
+                }
+
+                // Update the hot cache for subsequent packets
+                m_hotPort    = dstPortNet;
+                m_hotHandler = sub.handler;
+                m_hotContext = sub.context;
+            }
+
+            // ONLY COMPUTE LENGTHS IF WE HAVE A HANDLER
+            uint16_t udpLen = ntohs(udp->uh_ulen);
+            if (udpLen < 8) [[unlikely]] {
+                // udpLen should be at least its header
+                return;
+            }
+
+            // This protects against packets where the UDP header is bigger than PCAP.
+            if (caplen < (14 + ipHeaderLen + udpLen)) [[unlikely]] {
+                return; // Not enough data
+            }
+
+            const uint8_t* payload = packet + totalHeaderLen;
+            int32_t payloadLen = udpLen - 8;
+
+            m_hotHandler(m_hotContext, payload, payloadLen, status, ts);
+            return; // Fast path successful
         }
     }
 
