@@ -77,7 +77,7 @@ Result<void> EventLoop::addSource(int fd, uint32_t eventMask, InternalHandler ha
     }
 
     // Tell the kernel to start monitoring this FD
-    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) [[unlikely]] {
         // Return the system error code instead of throwing or ignoring
         return std::error_code(errno, std::generic_category());
     }
@@ -97,7 +97,7 @@ Result<void> EventLoop::removeSource(int fd) {
     // Note: We do this before clearing our internal vector.
     // In Linux < 2.6.9, epoll_ctl(DEL) required a valid pointer to event,
     // but modern kernels allow NULL.
-    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) [[unlikely]] {
         // If the FD wasn't registered, epoll_ctl returns ENOENT.
         // We can choose to return this error or ignore it.
         // Returning it is better for library debugging.
@@ -117,7 +117,7 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
     // Block until at least one event occurs or the timeout expires
     int ready = epoll_wait(m_epoll_fd, m_impl->events.data(), MAX_EVENTS, timeoutMs);
 
-    if (ready < 0) {
+    if (ready < 0) [[unlikely]] {
         // EINTR means a system signal (like Ctrl+C) woke us up; this is not a failure.
         if (errno == EINTR) {
             return Result<void>::success();
@@ -170,7 +170,7 @@ void EventLoop::runInLoop(std::function<void()> cb) {
 }
 
 Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
-    if (delay.count() < 0) {
+    if (delay.count() < 0) [[unlikely]] {
         return std::error_code(EINVAL, std::system_category());
     }
 
@@ -185,7 +185,7 @@ Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
 }
 
 Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
-    if (interval.count() <= 0) {
+    if (interval.count() <= 0) [[unlikely]] {
         return std::error_code(EINVAL, std::system_category());
     }
 
@@ -201,7 +201,7 @@ Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
 Result<void> EventLoop::cancelTimer(TimerId id) {
     auto it = m_activeTimers.find(id);
 
-    if (it == m_activeTimers.end()) {
+    if (it == m_activeTimers.end()) [[unlikely]] {
         // Return an error if the TimerId was not found
         return std::error_code(ENOENT, std::system_category());
     }
@@ -263,7 +263,7 @@ void EventLoop::handleTimerRead() {
     uint64_t expiredCount;
     // We must read the timerfd to clear the event, otherwise epoll triggers immediately again
     ssize_t n = ::read(m_timer_fd, &expiredCount, sizeof(expiredCount));
-    if (n != sizeof(expiredCount)) {
+    if (n != sizeof(expiredCount)) [[unlikely]] {
         return; // Should not happen
     }
 

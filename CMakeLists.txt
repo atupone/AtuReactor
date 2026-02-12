@@ -50,6 +50,8 @@ add_compile_options(
     -Wshadow
     -Wnon-virtual-dtor
     -ggdb -O3 -march=native
+    -DNDEBUG -fno-stack-protector -fomit-frame-pointer
+    -fno-plt
 )
 
 if(STRICT_WERROR)

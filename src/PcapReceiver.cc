@@ -208,17 +208,20 @@ void PcapReceiver::start() {
     });
 }
 
-// The core logic: Reads one packet from memory
 bool PcapReceiver::step() {
-    checkThread();
+    checkThread(); // Safety check only happens here
+    return internalStep();
+}
 
+// The core logic: Reads one packet from memory
+bool PcapReceiver::internalStep() noexcept {
     // New Delegation
     if (m_isPcapNg) {
         return stepPcapNg();
     }
 
     // EOF Check
-    if (m_currentPtr + sizeof(pcap_sf_pkthdr) > m_mappedData + m_fileSize) {
+    if (m_currentPtr + sizeof(pcap_sf_pkthdr) > m_mappedData + m_fileSize) [[unlikely]] {
         m_finished = true;
         return false;
     }
@@ -281,7 +284,7 @@ bool PcapReceiver::step() {
     return true;
 }
 
-bool PcapReceiver::stepPcapNg() {
+bool PcapReceiver::stepPcapNg() noexcept {
     uint32_t len;
 
     while (true) {
@@ -301,13 +304,13 @@ bool PcapReceiver::stepPcapNg() {
         }
 
         // Safety check
-        if (len < sizeof(PcapNgBlockHeader) || m_currentPtr + len > m_mappedData + m_fileSize) {
+        if (len < sizeof(PcapNgBlockHeader) || m_currentPtr + len > m_mappedData + m_fileSize) [[unlikely]] {
             m_finished = true;
             return false;
         }
 
         // 1. Enhanced Packet Block (EPB) - Type 6
-        if (type == PCAPNG_EPB) {
+        if (type == PCAPNG_EPB) [[likely]] {
             break;
         }
 
@@ -398,26 +401,30 @@ void PcapReceiver::processBatch() {
     while (totalProcessed < stopLimit) {
         // We prefetch ~128 bytes ahead of the current pointer.
         // This usually covers the next packet's Pcap header and Layer 2/3 headers.
-        if (m_currentPtr + 128 < m_mappedData + m_fileSize) {
+        if (m_currentPtr + 128 < m_mappedData + m_fileSize) [[likely]] {
             __builtin_prefetch(m_currentPtr + 128, 0, 3);
         }
 
         // step() returns false if EOF or if we are waiting for time
-        if (!step()) {
+        if (!internalStep()) {
             return;
         }
         totalProcessed++;
     }
 
+    if (m_finished) [[unlikely]] {
+        return;
+    }
+
     // Yield to event loop if we are just flooding (avoid freezing the app)
-    if (m_pcapConfig.mode == ReplayMode::FLOOD && !m_finished) {
+    if (m_pcapConfig.mode == ReplayMode::FLOOD) {
         m_loop.runInLoop([this]() {
             this->processBatch();
         });
     }
     // Note: In TIMED mode, step() handles the rescheduling when it hits a future packet.
     // If the batch finished but next packet is valid (catch-up scenario), schedule immediate continuation.
-    else if (m_pcapConfig.mode == ReplayMode::TIMED && !m_finished) {
+    else if (m_pcapConfig.mode == ReplayMode::TIMED) {
          m_loop.runAfter(Duration(0), [this]() {
             this->processBatch();
         });
@@ -425,23 +432,21 @@ void PcapReceiver::processBatch() {
 }
 
 void PcapReceiver::processBatchFlood() {
-    int totalProcessed = 0;
-    const int stopLimit = 10000;
+    constexpr int stopLimit = 20000;
+    constexpr int lookAhead = 512;
 
-    while (totalProcessed < stopLimit) {
-        // We prefetch ~128 bytes ahead of the current pointer.
-        // This usually covers the next packet's Pcap header and Layer 2/3 headers.
-        if (m_currentPtr + 128 < m_mappedData + m_fileSize) {
-            __builtin_prefetch(m_currentPtr + 128, 0, 3);
-        }
+    for (int i = 0; i < stopLimit; i++) {
+        // Calculate the next packet start if possible.
+        // We look "ahead" of the current packet size.
+        // Assuming a standard PCAP header (16 bytes) + typical packet
+        __builtin_prefetch(m_currentPtr + lookAhead, 0, 3);
 
-        // step() returns false if EOF or if we are waiting for time
-        if (!step()) {
+        // internalStep() returns false if EOF or if we are waiting for time
+        if (!internalStep()) [[unlikely]] {
             return;
         }
-        totalProcessed++;
     }
-    if (m_finished) {
+    if (m_finished) [[unlikely]] {
         return;
     }
 
@@ -455,7 +460,7 @@ void PcapReceiver::processBatchFlood() {
 std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
         const struct timespec& ts)
 {
-    if (m_firstPacket) {
+    if (m_firstPacket) [[unlikely]] {
         m_pcapStartTs = ts;
         m_wallStartTs = std::chrono::steady_clock::now();
         m_firstPacket = false;
@@ -575,8 +580,8 @@ void PcapReceiver::slowPathParse(const struct timespec& ts, uint32_t caplen, uin
         remaining -= 16;
     }
     else if (linkType == DLT_EN10MB) { // Standard Ethernet
-        // --- Layer 2: Ethernet ---
-        if (remaining < sizeof(struct ether_header)) return;
+                                       // --- Layer 2: Ethernet ---
+        if (remaining < sizeof(struct ether_header)) [[unlikely]] return;
         auto* eth = reinterpret_cast<const struct ether_header*>(ptr);
         proto = ntohs(eth->ether_type);
         ptr += sizeof(struct ether_header);
@@ -584,14 +589,14 @@ void PcapReceiver::slowPathParse(const struct timespec& ts, uint32_t caplen, uin
 
         // Handle 802.1Q VLAN Tagging
         if (proto == ETHERTYPE_VLAN) {
-            if (remaining < 4) return; // VLAN tag size
-            // Skip VLAN (simplified, assuming single tag)
+            if (remaining < 4) [[unlikely]] return; // VLAN tag size
+                                                    // Skip VLAN (simplified, assuming single tag)
             proto = ntohs(*reinterpret_cast<const uint16_t*>(ptr + 2));
             ptr += 4;
             remaining -= 4;
         }
     }
-    else {
+    else [[unlikely]] {
         // Unsupported link type (e.g. DLT_NULL/Loopback or DLT_RAW)
         return;
     }
@@ -615,28 +620,35 @@ void PcapReceiver::slowPathParse(const struct timespec& ts, uint32_t caplen, uin
     if (remaining < sizeof(struct udphdr)) [[unlikely]] return;
     auto* udp = reinterpret_cast<const struct udphdr*>(ptr);
 
-    uint16_t dstPort = udp->uh_dport;
-    auto& sub = m_portTable[dstPort];
+    uint16_t dstPortNet = udp->uh_dport;
 
-    if (sub.handler) {
-        // --- Dispatch ---
-        uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
-        if (udpLen < sizeof(struct udphdr)) [[unlikely]] return;
+    // CHECK PORT FIRST
+    if (dstPortNet != m_hotPort || m_hotHandler == nullptr) [[unlikely]] {
+        // Cache Miss or First Packet: Look up the port in our table
+        auto& sub = m_portTable[dstPortNet];
 
-        size_t dataLen = udpLen - sizeof(struct udphdr);
+        if (!sub.handler) {
+            return; // No subscription for this port
+        }
 
-        ptr += sizeof(struct udphdr);
-        remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
-
-        if (remaining < dataLen) [[unlikely]] return;
-
-        sub.handler(
-                sub.context,
-                const_cast<uint8_t*>(ptr),
-                dataLen,
-                PacketStatus::OK,
-                ts);
+        // Update the hot cache for subsequent packets
+        m_hotPort    = dstPortNet;
+        m_hotHandler = sub.handler;
+        m_hotContext = sub.context;
     }
+
+    // --- Dispatch ---
+    uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
+    if (udpLen < sizeof(struct udphdr)) [[unlikely]] return;
+
+    size_t dataLen = udpLen - sizeof(struct udphdr);
+
+    ptr += sizeof(struct udphdr);
+    remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
+
+    if (remaining < dataLen) [[unlikely]] return;
+
+    m_hotHandler(m_hotContext, ptr, dataLen, PacketStatus::OK, ts);
 }
 
 } // namespace atu_reactor

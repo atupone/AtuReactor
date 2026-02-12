@@ -157,7 +157,8 @@ class ATU_API PcapReceiver : public PacketReceiver {
     private:
         void processBatch();
         void processBatchFlood();
-        void parseAndDispatch(
+        inline bool internalStep() noexcept;
+        inline void parseAndDispatch(
                 const struct timespec & header,
                 uint32_t caplen,
                 uint32_t len,
@@ -170,7 +171,7 @@ class ATU_API PcapReceiver : public PacketReceiver {
         std::chrono::steady_clock::time_point calculateTargetTimeHighRes(const struct timespec& header);
 
         // Helper to read NG blocks
-        bool stepPcapNg();
+        inline bool stepPcapNg() noexcept;
 
         struct InterfaceInfo {
             uint16_t linkType;
