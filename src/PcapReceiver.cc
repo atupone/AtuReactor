@@ -397,7 +397,7 @@ void PcapReceiver::processBatch() {
 
     // Yield to event loop if we are just flooding (avoid freezing the app)
     if (m_pcapConfig.mode == ReplayMode::FLOOD && !m_finished) {
-        m_loop.runAfter(Duration(0), [this]() {
+        m_loop.runInLoop([this]() {
             this->processBatch();
         });
     }

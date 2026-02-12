@@ -104,6 +104,12 @@ class ATU_API EventLoop {
         Result<void> runOnce(int timeoutMs);
 
         /**
+         * @brief Schedules a function to be executed in the next iteration of the loop.
+         * Use this instead of runAfter(0, ...) to avoid system call overhead.
+         */
+        void runInLoop(std::function<void()> cb);
+
+        /**
          * @brief Run a callback once after a delay.
          * @return Unique ID to allow cancellation.
          */
@@ -157,6 +163,9 @@ class ATU_API EventLoop {
         struct Source {
             InternalHandler handler;
         };
+
+        // Queue for deferred execution
+        std::vector<std::function<void()>> m_pendingTasks;
 
         // Hybrid storage to prevent massive allocations on high FD numbers
         static constexpr int MAX_FAST_FDS = 1024; // Limit for direct indexing

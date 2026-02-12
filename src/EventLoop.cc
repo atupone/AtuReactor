@@ -108,6 +108,12 @@ Result<void> EventLoop::removeSource(int fd) {
 }
 
 Result<void> EventLoop::runOnce(int timeoutMs) {
+    // Optimization: If we have deferred tasks (e.g., PCAP flood),
+    // do not block the CPU. Force non-blocking poll.
+    if (!m_pendingTasks.empty()) {
+        timeoutMs = 0;
+    }
+
     // Block until at least one event occurs or the timeout expires
     int ready = epoll_wait(m_epoll_fd, m_impl->events.data(), MAX_EVENTS, timeoutMs);
 
@@ -143,8 +149,24 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
         }
     }
 
+    // 3. Execute Pending Tasks
+    // We swap to a local vector to handle re-entrant calls safely.
+    if (!m_pendingTasks.empty()) {
+        std::vector<std::function<void()>> tasks;
+        m_pendingTasks.swap(tasks);
+
+        for (const auto& task : tasks) {
+            task();
+        }
+    }
+
+
     // Final success return to satisfy the Result<void> return type
     return Result<void>::success();
+}
+
+void EventLoop::runInLoop(std::function<void()> cb) {
+    m_pendingTasks.push_back(std::move(cb));
 }
 
 Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
