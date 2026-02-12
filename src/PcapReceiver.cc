@@ -471,11 +471,22 @@ void PcapReceiver::parseAndDispatch(
                 auto* udp = reinterpret_cast<const struct udphdr*>(packet + 34);
 
                 // Optimized Network-Order Port Table lookup
-                auto& sub = m_portTable[udp->uh_dport];
-                if (sub.handler) {
-                    uint16_t udpLen = ntohs(udp->uh_ulen);
-                    // Standard UDP header is 8 bytes
-                    sub.handler(sub.context, packet + 42, udpLen - 8, PacketStatus::OK, ts);
+                uint16_t dstPortNet = udp->uh_dport;
+                uint16_t udpLen = ntohs(udp->uh_ulen);
+
+                if (dstPortNet == m_hotPort && m_hotHandler != nullptr) [[likely]] {
+                    m_hotHandler(m_hotContext, packet + 42, udpLen - 8, PacketStatus::OK, ts);
+                } else {
+                    auto& sub = m_portTable[dstPortNet];
+                    if (sub.handler) {
+                        // Update hot port for the next time
+                        m_hotPort = dstPortNet;
+                        m_hotHandler = sub.handler;
+                        m_hotContext = sub.context;
+
+                        // Standard UDP header is 8 bytes
+                        sub.handler(sub.context, packet + 42, udpLen - 8, PacketStatus::OK, ts);
+                    }
                 }
                 return; // Fast path successful
             }

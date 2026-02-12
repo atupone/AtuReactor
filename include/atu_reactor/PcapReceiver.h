@@ -207,6 +207,10 @@ class ATU_API PcapReceiver : public PacketReceiver {
         uint32_t m_interfaceCount = 0;
 
         bool m_isPcapNg = true;
+
+        uint16_t m_hotPort = 0; // In Network Byte Order
+        PacketHandlerFn m_hotHandler = nullptr;
+        void* m_hotContext = nullptr;
 };
 
 }  // namespace atu_reactor
