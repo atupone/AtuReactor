@@ -162,6 +162,8 @@ class ATU_API PcapReceiver : public PacketReceiver {
                 uint32_t len,
                 const uint8_t* packet,
                 uint32_t linkType);
+        void slowPathParse(const struct timespec& ts, uint32_t caplen, uint32_t len,
+                const uint8_t* packet, uint32_t linkType);
 
         // Helper to determine when a packet should be played in TIMED mode
         std::chrono::steady_clock::time_point calculateTargetTimeHighRes(const struct timespec& header);

@@ -170,8 +170,11 @@ Result<int> PcapReceiver::subscribe(uint16_t port,
         return baseRes;
     }
 
+    // Convert to Network Byte Order ONCE
+    uint16_t netPort = htons(port);
+
     // Perform PcapReceiver specific registration.
-    m_portTable[port] = {context, handler};
+    m_portTable[netPort] = {context, handler};
 
     // Return the port as the ID.
     // This allows the caller to treat the port as the 'handle' for this subscription.
@@ -452,7 +455,40 @@ void PcapReceiver::parseAndDispatch(
         const uint8_t* packet,
         uint32_t linkType)
 {
-    if (caplen != len) return; // Ignore truncated in capture
+    // The Super-Branch: LinkType, Integrity (caplen==len), and Min Length (42)
+    if (linkType == DLT_EN10MB && caplen == len && caplen >= 42) [[likely]] {
+
+        // Load 8 bytes from EtherType offset (12)
+        // This includes EtherType(2), Ver/IHL(1), TOS(1), TotalLen(2), ID(2)
+        uint64_t headerSlice = *reinterpret_cast<const uint64_t*>(packet + 12);
+
+        // Mask: Check EtherType is IPv4 (0x0800) and IP Ver/IHL is 0x45
+        // Mask: 0x0000000000FF0000FFFF (Little Endian logic for the load)
+        if ((headerSlice & 0x0000000000FF0000FFFF) == 0x00000000004500000800) [[likely]] {
+
+            // Verify Protocol is UDP (Offset 23 is 11 bytes after MACs)
+            if (packet[23] == IPPROTO_UDP) [[likely]] {
+                auto* udp = reinterpret_cast<const struct udphdr*>(packet + 34);
+
+                // Optimized Network-Order Port Table lookup
+                auto& sub = m_portTable[udp->uh_dport];
+                if (sub.handler) {
+                    uint16_t udpLen = ntohs(udp->uh_ulen);
+                    // Standard UDP header is 8 bytes
+                    sub.handler(sub.context, packet + 42, udpLen - 8, PacketStatus::OK, ts);
+                }
+                return; // Fast path successful
+            }
+        }
+    }
+
+    // Fallback for VLANs, SLL, or truncated packets
+    slowPathParse(ts, caplen, len, packet, linkType);
+}
+
+void PcapReceiver::slowPathParse(const struct timespec& ts, uint32_t caplen, uint32_t len,
+        const uint8_t* packet, uint32_t linkType) {
+    if (caplen != len) [[unlikely]] return; // Ignore truncated in capture
 
     const uint8_t* ptr = packet;
     uint32_t remaining = caplen;
@@ -507,20 +543,21 @@ void PcapReceiver::parseAndDispatch(
     if (remaining < sizeof(struct udphdr)) [[unlikely]] return;
     auto* udp = reinterpret_cast<const struct udphdr*>(ptr);
 
-    uint16_t dstPort = ntohs(udp->uh_dport);
-    uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
-    if (udpLen < sizeof(struct udphdr)) [[unlikely]] return;
-
-    size_t dataLen = udpLen - sizeof(struct udphdr);
-
-    ptr += sizeof(struct udphdr);
-    remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
-
-    if (remaining < dataLen) [[unlikely]] return;
-
-    // --- Dispatch ---
+    uint16_t dstPort = udp->uh_dport;
     auto& sub = m_portTable[dstPort];
+
     if (sub.handler) {
+        // --- Dispatch ---
+        uint16_t udpLen = ntohs(udp->uh_ulen); // Includes header
+        if (udpLen < sizeof(struct udphdr)) [[unlikely]] return;
+
+        size_t dataLen = udpLen - sizeof(struct udphdr);
+
+        ptr += sizeof(struct udphdr);
+        remaining -= static_cast<uint32_t>(sizeof(struct udphdr));
+
+        if (remaining < dataLen) [[unlikely]] return;
+
         sub.handler(
                 sub.context,
                 const_cast<uint8_t*>(ptr),
