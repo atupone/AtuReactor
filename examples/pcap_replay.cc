@@ -19,20 +19,34 @@
 #include <atu_reactor/PcapReceiver.h>
 #include <iostream>
 #include <unistd.h>
+#include <iomanip>
 
 using namespace atu_reactor;
 
-void onPacket(void*, const uint8_t*, size_t size, uint32_t, struct timespec ts) {
-    std::cout << "[Replay] Got " << size << " bytes at PCAP time " << ts.tv_sec << std::endl;
+struct ReplayContext {
+    bool quiet = false;
+    uint64_t totalPackets = 0;
+    uint64_t totalBytes = 0;
+};
+
+void onPacket(void* context, const uint8_t*, size_t size, uint32_t, struct timespec ts) {
+    auto* ctx = static_cast<ReplayContext*>(context);
+    ctx->totalPackets++;
+    ctx->totalBytes += size;
+    if (!ctx->quiet) {
+        std::cout << "[Replay] Got " << size << " bytes at PCAP time " << ts.tv_sec << std::endl;
+    }
 }
 
 int main(int argc, char** argv) {
     bool floodMode = false;
     int iterations = 1;
+    uint16_t targetPort = 5001; // Default port
+    ReplayContext replayCtx;
     int opt;
 
-    // Parse options: -f for flood, -n for number of iterations
-    while ((opt = getopt(argc, argv, "fn:")) != -1) {
+    // Parse options: -f for flood, -n for number of iterations, -p for port, -q for quiet
+    while ((opt = getopt(argc, argv, "fn:p:q")) != -1) {
         switch (opt) {
             case 'f':
                 floodMode = true;
@@ -40,8 +54,14 @@ int main(int argc, char** argv) {
             case 'n':
                 iterations = std::atoi(optarg);
                 break;
+            case 'p':
+                targetPort = static_cast<uint16_t>(std::atoi(optarg));
+                break;
+            case 'q':
+                replayCtx.quiet = true;
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [-f] [-n iterations] <file.pcap>" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [-f] [-n iterations] [-p port] <file.pcap>" << std::endl;
                 return 1;
         }
     }
@@ -69,8 +89,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Subscribe to port 5001 (assuming traffic in PCAP is on 5001)
-    auto res = player.subscribe(5001, nullptr, onPacket);
+    // Use the port provided by the user
+    auto res = player.subscribe(targetPort, &replayCtx, onPacket);
     if (!res) {
         std::cerr << "Failed to subscribe: " << res.error().message() << std::endl;
         return 1;
@@ -84,13 +104,14 @@ int main(int argc, char** argv) {
         while (!player.isFinished()) {
             loop.runOnce(floodMode ? 0 : 1).value();
         }
-
-        if (iterations > 1 && (i + 1) % 100 == 0) {
-            std::cout << "Completed " << (i + 1) << " iterations..." << std::endl;
-        }
     }
 
-    std::cout << "Finished all iterations." << std::endl;
+    // Print final summary stats
+    std::cout << "\n--- Replay Complete ---" << std::endl;
+    std::cout << "Total Packets Processed: " << replayCtx.totalPackets << std::endl;
+    std::cout << "Total Bytes Processed:   " << replayCtx.totalBytes << " ("
+        << (replayCtx.totalBytes / 1024 / 1024) << " MB)" << std::endl;
+
     return 0;
 }
 
