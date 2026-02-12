@@ -388,6 +388,12 @@ void PcapReceiver::processBatch() {
                           : m_pcapConfig.batchSize;
 
     while (totalProcessed < stopLimit) {
+        // We prefetch ~128 bytes ahead of the current pointer.
+        // This usually covers the next packet's Pcap header and Layer 2/3 headers.
+        if (m_currentPtr + 128 < m_mappedData + m_fileSize) {
+            __builtin_prefetch(m_currentPtr + 128, 0, 3);
+        }
+
         // step() returns false if EOF or if we are waiting for time
         if (!step()) {
             return;
