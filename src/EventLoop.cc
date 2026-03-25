@@ -107,6 +107,80 @@ Result<void> EventLoop::removeSource(int fd) {
     return Result<void>::success();
 }
 
+Result<void> EventLoop::addStreamSource(int fd, std::function<void(uint32_t, void*)> callback, void* context) {
+    if (fd < 0) {
+        return std::error_code(EINVAL, std::system_category());
+    }
+
+    // Prepare the epoll event
+    struct epoll_event ev{};
+    ev.events = EPOLLIN; // Default to triggering when data is ready to read
+
+    // Store the handler with its specific context
+    StreamTag tag{ std::move(callback), fd, context };
+
+    // Store in Hybrid Storage and link the pointer so runOnce can find it
+    if (fd < MAX_FAST_FDS) {
+        m_fastSources[fd].handler = tag;
+        ev.data.ptr = &m_fastSources[fd];
+    } else {
+        m_slowSources[fd].handler = tag;
+        ev.data.ptr = &m_slowSources[fd];
+    }
+
+    // Register with Kernel
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+        return std::error_code(errno, std::system_category());
+    }
+
+    return Result<void>::success();
+}
+
+Result<void> EventLoop::modifyStreamSource(int fd, uint32_t extraEvents) {
+    if (fd < 0) {
+        return std::error_code(EINVAL, std::system_category());
+    }
+
+    struct epoll_event ev{};
+    ev.events = EPOLLIN | extraEvents; // Always stay readable, add extra (like EPOLLOUT)
+
+    if (fd < MAX_FAST_FDS) {
+        ev.data.ptr = &m_fastSources[fd];
+    } else {
+        ev.data.ptr = &m_slowSources[fd];
+    }
+
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) {
+        return std::error_code(errno, std::system_category());
+    }
+
+    return Result<void>::success();
+}
+
+Result<void> EventLoop::removeStreamSource(int fd) {
+    if (fd < 0) {
+        return std::error_code(EINVAL, std::system_category());
+    }
+
+    // Remove from the Linux Kernel first
+    // Note: On modern kernels (2.6.9+), the event pointer can be NULL for DEL
+    if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+        // If the FD wasn't there, we return the error (usually ENOENT)
+        return std::error_code(errno, std::system_category());
+    }
+
+    // Clean up our internal storage
+    if (fd < MAX_FAST_FDS) {
+        // Reset the variant to monostate (empty)
+        m_fastSources[fd].handler = std::monostate{};
+    } else {
+        // Remove from the map
+        m_slowSources.erase(fd);
+    }
+
+    return Result<void>::success();
+}
+
 Result<void> EventLoop::runOnce(int timeoutMs) {
     // Optimization: If we have deferred tasks (e.g., PCAP flood),
     // do not block the CPU. Force non-blocking poll.
@@ -129,12 +203,20 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
 
     // Iterate only through the number of file descriptors that actually have events
     for (int i = 0; i < ready; ++i) {
-        // Retrieve the pointer we saved earlier
-        Source* source = static_cast<Source*>(m_impl->events[i].data.ptr);
+        auto& event = m_impl->events[i];
+
+        // Retrieve the Source pointer from the epoll event
+        Source* source = static_cast<Source*>(event.data.ptr);
+        uint32_t events = event.events; // Get the triggered events
 
         if (source) {
-            // 2. Dispatch using the pointer
-            std::visit([this](auto&& arg) {
+            // We need the FD for the callback.
+            // Since we used .ptr for epoll, we find the FD by its position in the array
+            // or by mapping. However, for a generic callback, we can pass the FD
+            // if we reconstruct it or if the callback already knows it.
+
+            // Dispatch using the pointer
+            std::visit([this, events](auto&& arg) {
                 using T = std::decay_t<decltype(arg)>;
 
                 if constexpr (std::is_same_v<T, TimerTag>) {
@@ -144,12 +226,18 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
                 } else if constexpr (std::is_same_v<T, UDPReceiverTag>) {
                     // Pass the event to the receiver
                     arg.receiver->handleRead(arg.fd, arg.userContext, arg.handler);
+                } else if constexpr (std::is_same_v<T, StreamTag>) {
+                    // Execute the TCP/Stream logic!
+                    if (arg.callback) {
+                        // arg.context is the specific data for THIS connection
+                        arg.callback(events, arg.context);
+                    }
                 }
             }, source->handler);
         }
     }
 
-    // 3. Execute Pending Tasks
+    // Execute Pending Tasks
     // We swap to a local vector to handle re-entrant calls safely.
     if (!m_pendingTasks.empty()) {
         std::vector<std::function<void()>> tasks;

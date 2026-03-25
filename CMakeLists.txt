@@ -70,6 +70,7 @@ add_library(AtuReactor SHARED
     src/PacketReceiver.cc
     src/UDPReceiver.cc
     src/PcapReceiver.cc
+    src/TcpMessaging.cc
 )
 
 add_library(AtuReactor::AtuReactor ALIAS AtuReactor)
@@ -174,6 +175,10 @@ if(BUILD_EXAMPLES)
     add_executable(pcap_replay.cc examples/pcap_replay.cc)
     target_link_libraries(pcap_replay.cc PRIVATE AtuReactor)
 
+    # 5. gateway bridge
+    add_executable(radar_ui_bridge examples/radar_ui_bridge.cc)
+    target_link_libraries(radar_ui_bridge PRIVATE AtuReactor)
+
     target_link_options(pcap_replay.cc PRIVATE "-Wl,-z,now" "-Wl,-Bsymbolic")
 
     message(STATUS "Example programs are enabled")
@@ -218,6 +223,10 @@ if(BUILD_TESTING)
     add_executable(TimerTests tests/TimerTest.cc)
     target_link_libraries(TimerTests PRIVATE AtuReactor GTest::GTest GTest::Main)
     add_test(NAME TimerTests COMMAND TimerTests)
+
+    add_executable(TcpMessagingTest tests/TcpMessagingTest.cc)
+    target_link_libraries(TcpMessagingTest PRIVATE AtuReactor GTest::GTest GTest::Main)
+    add_test(NAME TcpMessagingTest COMMAND TcpMessagingTest)
 
     message(STATUS "Unit tests are enabled")
 else()

@@ -49,9 +49,19 @@ struct UDPReceiverTag {
     void* userContext;
     PacketHandlerFn handler;
 };
+struct StreamTag {
+    std::function<void(uint32_t, void*)> callback;
+    int fd;
+    void* context; // Pointer to the Streaming instance
+};
 
 // The dispatch variant
-using InternalHandler = std::variant<std::monostate, TimerTag, UDPReceiverTag>;
+using InternalHandler = std::variant<
+    std::monostate,
+    TimerTag,
+    UDPReceiverTag,
+    StreamTag
+>;
 
 using Clock = std::chrono::steady_clock;
 using Timestamp = std::chrono::time_point<Clock>;
@@ -96,6 +106,20 @@ class ATU_API EventLoop {
          * @param fd The descriptor to stop monitoring.
          */
         Result<void> removeSource(int fd);
+
+        /**
+         * @brief Registers a generic stream-based file descriptor (TCP, Pipe, etc.) with the loop.
+         * * This adds the file descriptor to the epoll interest list. When the descriptor becomes
+         * readable (EPOLLIN), the provided callback is executed within the EventLoop thread.
+         * * @param fd The file descriptor to monitor. Must be valid and non-blocking.
+         * @param callback The function to execute when data is available to read.
+         * @return Result<void> Success, or an error code if the FD is out of range or epoll fails.
+         * * @note If fd < 1024, it uses fast direct-indexing storage. Otherwise, it uses a map.
+         * @warning The callback is executed on the EventLoop thread. Avoid blocking operations.
+         */
+        Result<void> addStreamSource(int fd, std::function<void(uint32_t, void*)> callback, void* context);
+        Result<void> modifyStreamSource(int fd, uint32_t extraEvents);
+        Result<void> removeStreamSource(int fd);
 
         /**
          * @brief Waits for and dispatches pending events.
