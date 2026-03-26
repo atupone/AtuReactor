@@ -52,6 +52,9 @@ namespace atu_reactor {
             return;
         }
 
+        // Now that we have a valid resource, we open the "gate"
+        m_closed = false;
+
         // Set non-blocking so the EventLoop never stalls
         fcntl(m_fd, F_SETFL, fcntl(m_fd, F_GETFL, 0) | O_NONBLOCK);
 
@@ -64,11 +67,12 @@ namespace atu_reactor {
             return;
         }
 
+        // Register with the reactor.
         m_loop.addStreamSource(m_fd, &TcpMessaging::onEvent, this);
 
         if (res == 0) {
             m_connected = true;
-        } else if (errno == EINPROGRESS) {
+        } else {
             // Handshake in progress: MUST listen for EPOLLOUT to know when it finishes
             m_loop.modifyStreamSource(m_fd, EPOLLOUT);
         }
@@ -115,7 +119,7 @@ namespace atu_reactor {
     }
 
     void TcpMessaging::send(std::string_view data) {
-        if (m_fd < 0) {
+        if (m_closed) {
             return; // Socket must at least exist
         }
 
@@ -157,19 +161,46 @@ namespace atu_reactor {
             m_writeBuffer.erase(m_writeBuffer.begin(), m_writeBuffer.begin() + n);
         }
 
-        // If buffer is finally empty, stop listening for EPOLLOUT
         if (m_writeBuffer.empty()) {
-            m_loop.modifyStreamSource(m_fd, 0); // Back to just EPOLLIN
+            if (m_closed) {
+                // THE DRAIN IS COMPLETE.
+                // We were 'connected' but 'closed'. Now we can fully disconnect.
+                forceClose();
+            } else {
+                // Normal operation: just stop asking for EPOLLOUT
+                m_loop.modifyStreamSource(m_fd, EPOLLIN);
+            }
         }
     }
 
     void TcpMessaging::close() {
+        // If we are already closed or in the process of closing, do nothing.
+        if (m_closed) {
+            return;
+        }
+
+        // Mark as closed immediately to reject new data
+        m_closed = true;
+
+        if (m_writeBuffer.empty()) {
+            // No data to wait for? Kill the connection now.
+            forceClose();
+        }
+
+        // If NOT empty, we do NOT call ::close here.
+        // We let handleWrite() finish the buffer.
+    }
+
+    void TcpMessaging::forceClose()
+    {
         if (m_fd >= 0) {
             m_loop.removeStreamSource(m_fd);
             ::close(m_fd);
             m_fd = -1;
         }
         m_connected = false;
+        m_closed = true;
+        m_writeBuffer.clear();
     }
 
 

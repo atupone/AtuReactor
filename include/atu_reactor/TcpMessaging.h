@@ -63,12 +63,15 @@ class ATU_API TcpMessaging {
         void handleRead();
         void handleWrite(); // logic to empty the buffer
         void handleConnect();
+        void forceClose();
 
         EventLoop& m_loop;
         int m_fd = -1;
-        bool m_connected = false;
         DataCallback m_onData;
         std::vector<uint8_t> m_writeBuffer;
+
+        bool m_connected = false;
+        bool m_closed = true;
 };
 
 }  // namespace atu_reactor
