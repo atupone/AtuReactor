@@ -101,7 +101,11 @@ namespace atu_reactor {
 
         if (error == 0) {
             m_connected = true;
-            // Connection success!
+            // Stop listening for EPOLLOUT now that we are connected,
+            // unless a send() queued data while the handshake was happening.
+            if (m_writeBuffer.empty()) {
+                m_loop.modifyStreamSource(m_fd, 0);
+            }
         } else {
             close(); // Connection failed
         }
@@ -152,6 +156,8 @@ namespace atu_reactor {
 
     void TcpMessaging::handleWrite() {
         if (m_writeBuffer.empty()) {
+            // Clear EPOLLOUT if we get stuck in a state with an empty buffer
+            m_loop.modifyStreamSource(m_fd, 0);
             return;
         }
 
@@ -168,7 +174,7 @@ namespace atu_reactor {
                 forceClose();
             } else {
                 // Normal operation: just stop asking for EPOLLOUT
-                m_loop.modifyStreamSource(m_fd, EPOLLIN);
+                m_loop.modifyStreamSource(m_fd, 0);
             }
         }
     }
