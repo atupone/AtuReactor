@@ -116,7 +116,7 @@ TEST(TcpMessagingTest, EpollOutDoesNotSpinOnIdle) {
 
     // Read the data on the server side to clear the pipe
     char buf[16];
-    read(accepted_fd, buf, sizeof(buf));
+    [[maybe_unused]] ssize_t bytesReat = read(accepted_fd, buf, sizeof(buf));
 
     // Now the client buffer is empty again. Ensure it goes back to sleep.
     start = std::chrono::steady_clock::now();
