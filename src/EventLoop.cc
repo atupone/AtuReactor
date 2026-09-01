@@ -28,6 +28,9 @@
 // Library headers
 #include <atu_reactor/UDPReceiver.h>
 
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
 namespace atu_reactor {
 
 struct EventLoop::EpollInternal {
@@ -217,23 +220,18 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
             // if we reconstruct it or if the callback already knows it.
 
             // Dispatch using the pointer
-            std::visit([this, events](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-
-                if constexpr (std::is_same_v<T, TimerTag>) {
-                    // Timers generally only trigger on EPOLLIN,
-                    // but we call it normally.
+            std::visit(overloaded {
+                [this](const TimerTag&) {
                     handleTimerRead();
-                } else if constexpr (std::is_same_v<T, UDPReceiverTag>) {
-                    // Pass the event to the receiver
-                    arg.receiver->handleRead(arg.fd, arg.userContext, arg.handler);
-                } else if constexpr (std::is_same_v<T, StreamTag>) {
-                    // Execute the TCP/Stream logic!
-                    if (arg.callback) {
-                        // arg.context is the specific data for THIS connection
-                        arg.callback(events, arg.context);
-                    }
-                }
+                },
+                [](const UDPReceiverTag& tag) {
+                    tag.receiver->handleRead(tag.fd, tag.userContext, tag.handler);
+                },
+                [events](const StreamTag& tag) {
+                    if (tag.callback)
+                        tag.callback(events, tag.context);
+                },
+                [](std::monostate) {}
             }, source->handler);
         }
     }
