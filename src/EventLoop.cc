@@ -339,8 +339,11 @@ void EventLoop::resetTimerFd() {
     } else {
         // Calculate delay from now until next expiration
         auto dur = expiration - now;
-        newValue.it_value.tv_sec = std::chrono::duration_cast<std::chrono::seconds>(dur).count();
-        newValue.it_value.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count() % 1'000'000'000;
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(dur);
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(dur - secs);
+
+        newValue.it_value.tv_sec = secs.count();
+        newValue.it_value.tv_nsec = nsecs.count();
     }
 
     // Using Absolute Time is safer against system clock drift
