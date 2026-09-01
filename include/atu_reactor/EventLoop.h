@@ -20,7 +20,6 @@
 // System headers
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -35,7 +34,21 @@
 
 namespace atu_reactor {
 
-// Forward declaration
+// Raw function pointer types for zero-overhead execution
+using TaskCallbackFn = void(*)(void* context);
+using StreamCallbackFn = void(*)(uint32_t events, void* context);
+
+// Lightweight structure replacing std::function/MoveOnlyTask
+struct Task {
+    TaskCallbackFn fn{nullptr};
+    void* context{nullptr};
+
+    void operator()() const noexcept {
+        if (fn) fn(context);
+    }
+};
+
+// Forward declarations
 class EventLoop;
 class UDPReceiver;
 
@@ -50,7 +63,7 @@ struct UDPReceiverTag {
     PacketHandlerFn handler;
 };
 struct StreamTag {
-    std::function<void(uint32_t, void*)> callback;
+    StreamCallbackFn callback;
     int fd;
     void* context; // Pointer to the Streaming instance
 };
@@ -80,8 +93,6 @@ using EventCallbackFn = void(*)(void* context, uint32_t events);
  */
 class ATU_API EventLoop {
     public:
-        using TimerCallback = std::function<void()>;
-
         /**
          * @brief Initializes the epoll instance.
          * @throws std::runtime_error if epoll_create1 fails.
@@ -130,7 +141,8 @@ class ATU_API EventLoop {
          * @warning @p callback runs directly on the event loop thread. Do not perform blocking operations
          *          inside the callback.
          */
-        Result<void> addStreamSource(int fd, std::function<void(uint32_t, void*)> callback, void* context);
+        Result<void> addStreamSource(int fd, StreamCallbackFn callback, void* context);
+
         /**
          * @brief Modifies the epoll event mask for an already-registered stream source.
          *
@@ -143,6 +155,7 @@ class ATU_API EventLoop {
          * @return Result<void> Success (`Result::ok()`), or an error if @p fd is not found or `epoll_ctl` fails.
          */
         Result<void> modifyStreamSource(int fd, uint32_t extraEvents);
+
         /**
          * @brief Unregisters a stream file descriptor from the event loop.
          *
@@ -164,19 +177,19 @@ class ATU_API EventLoop {
          * @brief Schedules a function to be executed in the next iteration of the loop.
          * Use this instead of runAfter(0, ...) to avoid system call overhead.
          */
-        void runInLoop(std::function<void()> cb);
+        void runInLoop(TaskCallbackFn fn, void* context);
 
         /**
          * @brief Run a callback once after a delay.
          * @return Unique ID to allow cancellation.
          */
-        Result<TimerId> runAfter(Duration delay, TimerCallback cb);
+        Result<TimerId> runAfter(Duration delay, TaskCallbackFn fn, void* context);
 
         /**
          * @brief Run a callback periodically.
          * @return Unique ID to allow cancellation.
          */
-        Result<TimerId> runEvery(Duration interval, TimerCallback cb);
+        Result<TimerId> runEvery(Duration interval, TaskCallbackFn fn, void* context);
 
         /**
          * @brief Cancel a specific timer if it hasn't run yet.
@@ -192,7 +205,7 @@ class ATU_API EventLoop {
         struct Timer {
             Timestamp expiration;
             Duration interval; // Zero if one-shot
-            TimerCallback callback;
+            Task task;
             TimerId id;
             bool repeat;
             bool cancelled{false}; // Used for lazy deletion
@@ -229,7 +242,7 @@ class ATU_API EventLoop {
         };
 
         // Queue for deferred execution
-        std::vector<std::function<void()>> m_pendingTasks;
+        std::vector<Task> m_pendingTasks;
 
         // Hybrid storage to prevent massive allocations on high FD numbers
         static constexpr int MAX_FAST_FDS = 1024; // Limit for direct indexing

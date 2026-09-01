@@ -203,9 +203,7 @@ void PcapReceiver::start() {
     }
 
     // For TIMED or FLOOD, schedule the first batch immediately
-    m_loop.runAfter(std::chrono::milliseconds(0), [this]() {
-        processBatch();
-    });
+    m_loop.runAfter(std::chrono::milliseconds(0), &PcapReceiver::processBatchProxy, this);
 }
 
 bool PcapReceiver::step() {
@@ -265,9 +263,7 @@ bool PcapReceiver::internalStep() noexcept {
             // We return FALSE so the loop stops, but we DO NOT advance m_currentPtr.
             // We reschedule the loop to wake up at targetTime.
             auto delay = std::chrono::duration_cast<Duration>(targetTime - now);
-            m_loop.runAfter(delay, [this]() {
-                this->processBatch();
-            });
+            m_loop.runAfter(delay, &PcapReceiver::processBatchProxy, this);
             return false;
         }
     }
@@ -368,7 +364,7 @@ bool PcapReceiver::stepPcapNg() noexcept {
         auto now = std::chrono::steady_clock::now();
         if (targetTime > now) {
             auto delay = std::chrono::duration_cast<Duration>(targetTime - now);
-            m_loop.runAfter(delay, [this]() { this->processBatch(); });
+            m_loop.runAfter(delay, &PcapReceiver::processBatchProxy, this);
             return false; // Valid wait, do not advance pointer
         }
     }
@@ -418,16 +414,12 @@ void PcapReceiver::processBatch() {
 
     // Yield to event loop if we are just flooding (avoid freezing the app)
     if (m_pcapConfig.mode == ReplayMode::FLOOD) {
-        m_loop.runInLoop([this]() {
-            this->processBatch();
-        });
+        m_loop.runInLoop(&PcapReceiver::processBatchProxy, this);
     }
     // Note: In TIMED mode, step() handles the rescheduling when it hits a future packet.
     // If the batch finished but next packet is valid (catch-up scenario), schedule immediate continuation.
     else if (m_pcapConfig.mode == ReplayMode::TIMED) {
-         m_loop.runAfter(Duration(0), [this]() {
-            this->processBatch();
-        });
+         m_loop.runAfter(Duration(0), &PcapReceiver::processBatchProxy, this);
     }
 }
 
@@ -450,9 +442,7 @@ void PcapReceiver::processBatchFlood() {
         return;
     }
 
-    m_loop.runInLoop([this]() {
-        this->processBatchFlood();
-    });
+    m_loop.runInLoop(&PcapReceiver::processBatchFloodProxy, this);
 }
 
 
@@ -650,6 +640,19 @@ void PcapReceiver::slowPathParse(const struct timespec& ts, uint32_t caplen, uin
 
     m_hotHandler(m_hotContext, ptr, dataLen, PacketStatus::OK, ts);
 }
+
+void PcapReceiver::processBatchProxy(void* context) {
+    if (context) {
+        static_cast<PcapReceiver*>(context)->processBatch();
+    }
+}
+
+void PcapReceiver::processBatchFloodProxy(void* context) {
+    if (context) {
+        static_cast<PcapReceiver*>(context)->processBatchFlood();
+    }
+}
+
 
 } // namespace atu_reactor
 

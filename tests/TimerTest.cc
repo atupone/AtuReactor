@@ -20,6 +20,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <vector>
 
 using namespace atu_reactor;
 using namespace std::chrono_literals;
@@ -34,10 +35,13 @@ TEST_F(TimerTest, OneShotExecutesAfterDelay) {
     std::atomic<bool> fired{false};
     auto start = std::chrono::steady_clock::now();
 
+    auto callback = [](void* ctx) {
+        auto* f = static_cast<std::atomic<bool>*>(ctx);
+        *f = true;
+    };
+
     // Schedule for 100ms
-    auto res = loop.runAfter(std::chrono::milliseconds(100), [&]() {
-        fired = true;
-    });
+    auto res = loop.runAfter(std::chrono::milliseconds(100), callback, &fired);
     ASSERT_TRUE(res.has_value()) << "runAfter failed: " << res.error().message();
 
     // Run once immediately: should not fire
@@ -58,10 +62,13 @@ TEST_F(TimerTest, OneShotExecutesAfterDelay) {
 TEST_F(TimerTest, PeriodicTimerRepeats) {
     int fireCount = 0;
 
+    auto callback = [](void* ctx) {
+        auto* count = static_cast<int*>(ctx);
+        (*count)++;
+    };
+
     // Fire every 50ms
-    loop.runEvery(std::chrono::milliseconds(50), [&]() {
-        fireCount++;
-    });
+    loop.runEvery(std::chrono::milliseconds(50), callback, &fireCount);
 
     // Run loop for 170ms
     auto start = std::chrono::steady_clock::now();
@@ -77,10 +84,13 @@ TEST_F(TimerTest, PeriodicTimerRepeats) {
 TEST_F(TimerTest, CancelledTimerNeverFires) {
     bool fired = false;
 
+    auto callback = [](void* ctx) {
+        auto* f = static_cast<bool*>(ctx);
+        *f = true;
+    };
+
     // Capture the Result object
-    auto res = loop.runAfter(std::chrono::milliseconds(50), [&]() {
-        fired = true;
-    });
+    auto res = loop.runAfter(std::chrono::milliseconds(50), callback, &fired);
 
     // Verify success
     ASSERT_TRUE(res.has_value()) << "runAfter failed: " << res.error().message();
@@ -101,17 +111,24 @@ TEST_F(TimerTest, CancelledTimerNeverFires) {
 // Test 4: Multiple Timers (Min-Heap Verification)
 // This ensures that even if we add timers out of order, the earliest one wakes the loop
 TEST_F(TimerTest, OutOfOrderTimers) {
-    std::vector<int> executionOrder;
+    struct TimerCtx {
+        std::vector<int>* vec;
+        int val;
+    };
 
-    loop.runAfter(
-        std::chrono::milliseconds(200),
-        [&]() { executionOrder.push_back(200); }).value();
-    loop.runAfter(
-        std::chrono::milliseconds(50),
-        [&]() { executionOrder.push_back(50);  }).value();
-    loop.runAfter(
-        std::chrono::milliseconds(100),
-        [&]() { executionOrder.push_back(100); }).value();
+    auto callback = [](void* ctx) {
+        auto* tctx = static_cast<TimerCtx*>(ctx);
+        tctx->vec->push_back(tctx->val);
+    };
+
+    std::vector<int> executionOrder;
+    TimerCtx ctx200{&executionOrder, 200};
+    TimerCtx ctx50{&executionOrder, 50};
+    TimerCtx ctx100{&executionOrder, 100};
+
+    loop.runAfter(std::chrono::milliseconds(200), callback, &ctx200).value();
+    loop.runAfter(std::chrono::milliseconds(50), callback, &ctx50).value();
+    loop.runAfter(std::chrono::milliseconds(100), callback, &ctx100).value();
 
     // Run until all 3 fire
     auto start = std::chrono::steady_clock::now();

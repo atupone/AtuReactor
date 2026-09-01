@@ -14,6 +14,15 @@
 
 using namespace atu_reactor;
 
+// Helper function for stateful timer callback
+void heartbeatCallback(void* context) {
+    if (context) {
+        auto* counter = static_cast<int*>(context);
+        (*counter)++;
+        std::cout << "[Periodic] Heartbeat " << *counter << "s elapsed" << std::endl;
+    }
+}
+
 int main() {
     EventLoop loop;
 
@@ -21,27 +30,31 @@ int main() {
 
     // Example 1: Periodic Heartbeat (every 1 second)
     int counter = 0;
-    auto res1 = loop.runEvery(std::chrono::seconds(1), [&counter]() {
-        counter++;
-        std::cout << "[Periodic] Heartbeat " << counter << "s elapsed" << std::endl;
-    });
+    auto res1 = loop.runEvery(std::chrono::seconds(1), heartbeatCallback, &counter);
     if (!res1) {
         std::cerr << "Failed to schedule periodic timer" << std::endl;
     }
 
     // Example 2: One-shot delayed task (triggers once after 3.5 seconds)
-    auto res2 = loop.runAfter(std::chrono::milliseconds(3500), []() {
-        std::cout << "[One-Shot] 3.5 seconds have passed. Cleaning up resources..." << std::endl;
-    });
+    auto res2 = loop.runAfter(
+        std::chrono::milliseconds(3500),
+        [](void* /*context*/) {
+                std::cout << "[One-Shot] 3.5 seconds have passed. Cleaning up resources..." << std::endl;
+        },
+        nullptr
+    );
     if (!res2) {
         std::cerr << "Failed to schedule one-shot timer" << std::endl;
     }
 
     // Example 3: Self-canceling logic
     // We schedule a task for 10s, but we will exit the loop before it fires
-    auto res3 = loop.runAfter(std::chrono::seconds(10), []() {
-        std::cout << "This should never print!" << std::endl;
-    });
+    auto res3 = loop.runAfter(std::chrono::seconds(10),
+        [](void* /*context*/) {
+           std::cout << "This should never print!" << std::endl;
+        },
+        nullptr
+    );
     if (!res3) {
         std::cerr << "Failed to schedule 10s timer: " << res3.error().message() << std::endl;
     }

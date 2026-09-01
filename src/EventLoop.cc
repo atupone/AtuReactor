@@ -24,6 +24,7 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include <span>
 
 // Library headers
 #include <atu_reactor/UDPReceiver.h>
@@ -111,7 +112,7 @@ Result<void> EventLoop::removeSource(int fd) {
     return Result<void>::success();
 }
 
-Result<void> EventLoop::addStreamSource(int fd, std::function<void(uint32_t, void*)> callback, void* context) {
+Result<void> EventLoop::addStreamSource(int fd, StreamCallbackFn callback, void* context) {
     if (fd < 0) {
         return std::error_code(EINVAL, std::system_category());
     }
@@ -121,7 +122,7 @@ Result<void> EventLoop::addStreamSource(int fd, std::function<void(uint32_t, voi
     ev.events = EPOLLIN; // Default to triggering when data is ready to read
 
     // Store the handler with its specific context
-    StreamTag tag{ std::move(callback), fd, context };
+    StreamTag tag{ callback, fd, context };
 
     // Store in Hybrid Storage and link the pointer so runOnce can find it
     if (fd < MAX_FAST_FDS) {
@@ -239,8 +240,8 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
     // Execute Pending Tasks
     // We swap to a local vector to handle re-entrant calls safely.
     if (!m_pendingTasks.empty()) {
-        std::vector<std::function<void()>> tasks;
-        m_pendingTasks.swap(tasks);
+        std::vector<Task> tasks;
+        tasks.swap(m_pendingTasks);
 
         for (const auto& task : tasks) {
             task();
@@ -252,18 +253,18 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
     return Result<void>::success();
 }
 
-void EventLoop::runInLoop(std::function<void()> cb) {
-    m_pendingTasks.push_back(std::move(cb));
+void EventLoop::runInLoop(TaskCallbackFn fn, void* context) {
+    m_pendingTasks.push_back(Task{fn, context});
 }
 
-Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
+Result<TimerId> EventLoop::runAfter(Duration delay, TaskCallbackFn fn, void* context) {
     if (delay.count() < 0) [[unlikely]] {
         return std::error_code(EINVAL, std::system_category());
     }
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + delay;
-    auto t = std::make_shared<Timer>(Timer{when, Duration(0), std::move(cb), id, false, false});
+    auto t = std::make_shared<Timer>(Timer{when, Duration(0), Task{fn, context}, id, false, false});
 
     insertTimer(t);
 
@@ -271,14 +272,14 @@ Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
     return id;
 }
 
-Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
+Result<TimerId> EventLoop::runEvery(Duration interval, TaskCallbackFn fn, void* context) {
     if (interval.count() <= 0) [[unlikely]] {
         return std::error_code(EINVAL, std::system_category());
     }
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + interval;
-    auto t = std::make_shared<Timer>(Timer{when, interval, std::move(cb), id, true, false});
+    auto t = std::make_shared<Timer>(Timer{when, interval, Task{fn, context}, id, true, false});
 
     insertTimer(t);
 
@@ -398,8 +399,8 @@ void EventLoop::handleTimerRead() {
 
     // Process callbacks
     for (auto& t : expired) {
-        if (!t->cancelled && t->callback) {
-            t->callback();
+        if (!t->cancelled) {
+            t->task();
         }
 
         // Reschedule repeating timers if not cancelled
@@ -407,7 +408,7 @@ void EventLoop::handleTimerRead() {
             auto newTimer = std::make_shared<Timer>(Timer{
                 t->expiration + t->interval,
                 t->interval,
-                t->callback,
+                t->task,
                 t->id,
                 true,
                 false

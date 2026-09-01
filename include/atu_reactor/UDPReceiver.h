@@ -21,8 +21,9 @@
 #include <atu_reactor/PacketReceiver.h>
 
 // System headers
-#include <netinet/in.h>
+#include <array>
 #include <vector>
+#include <netinet/in.h>
 #include <sys/socket.h>
 
 // Library headers
