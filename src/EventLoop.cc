@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <unistd.h>
 
 // Library headers
 #include <atu_reactor/UDPReceiver.h>
@@ -264,12 +265,12 @@ Result<TimerId> EventLoop::runAfter(Duration delay, TimerCallback cb) {
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + delay;
-    Timer t{when, Duration(0), std::move(cb), id, false};
+    auto t = std::make_shared<Timer>(Timer{when, Duration(0), std::move(cb), id, false, false});
 
-    insertTimer(std::move(t));
+    insertTimer(t);
 
     // Return the id; it will be wrapped in Result<TimerId> automatically
-    return t.id;
+    return id;
 }
 
 Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
@@ -279,9 +280,9 @@ Result<TimerId> EventLoop::runEvery(Duration interval, TimerCallback cb) {
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + interval;
-    Timer t{when, interval, std::move(cb), id, true};
+    auto t = std::make_shared<Timer>(Timer{when, interval, std::move(cb), id, true, false});
 
-    insertTimer(std::move(t));
+    insertTimer(t);
 
     return id;
 }
@@ -294,8 +295,9 @@ Result<void> EventLoop::cancelTimer(TimerId id) {
         return std::error_code(ENOENT, std::system_category());
     }
 
-    m_timers.erase(it->second); // Remove from the set
-    m_activeTimers.erase(it);   // Remove from the map
+    // Lazy Deletion: mark the timer as cancelled in O(1)
+    it->second->cancelled = true;
+    m_activeTimers.erase(it);
 
     // If we removed the earliest timer, we must update the hardware timer
     // to reflect the new earliest time.
@@ -304,14 +306,20 @@ Result<void> EventLoop::cancelTimer(TimerId id) {
     return Result<void>::success();
 }
 
-void EventLoop::insertTimer(Timer t) {
+void EventLoop::insertTimer(TimerPtr t) {
     bool earliestChanged = false;
-    if (m_timers.empty() || t.expiration < m_timers.begin()->expiration) {
+
+    // Purge cancelled elements from top before checking earliest
+    while (!m_timers.empty() && m_timers.top()->cancelled) {
+        m_timers.pop();
+    }
+
+    if (m_timers.empty() || t->expiration < m_timers.top()->expiration) {
         earliestChanged = true;
     }
 
-    auto result = m_timers.insert(std::move(t));
-    m_activeTimers[result.first->id] = result.first;
+    m_activeTimers[t->id] = t;
+    m_timers.push(t);
 
     if (earliestChanged) {
         resetTimerFd();
@@ -319,6 +327,11 @@ void EventLoop::insertTimer(Timer t) {
 }
 
 void EventLoop::resetTimerFd() {
+    // Purge cancelled items from the top of the min-heap
+    while (!m_timers.empty() && m_timers.top()->cancelled) {
+        m_timers.pop();
+    }
+
     if (m_timers.empty()) {
         // Disarm timer
         struct itimerspec newValue{};
@@ -327,7 +340,7 @@ void EventLoop::resetTimerFd() {
     }
 
     auto now = Clock::now();
-    auto expiration = m_timers.begin()->expiration;
+    auto expiration = m_timers.top()->expiration;
 
     struct itimerspec newValue{};
 
@@ -364,29 +377,48 @@ void EventLoop::handleTimerRead() {
     // We must be careful: the callback might add new timers or cancel existing ones.
     // Iterating while modifying requires care.
 
-    // 1. Extract all expired timers from the set
-    std::vector<Timer> expired;
-    while (!m_timers.empty() && m_timers.begin()->expiration <= now) {
-        auto it = m_timers.begin();
-        expired.push_back(std::move(*it));
-        m_activeTimers.erase(it->id);
-        m_timers.erase(it);
+    // Extract all expired timers from the set
+    std::vector<TimerPtr> expired;
+
+    // Pop all expired timers, discarding any cancelled ones along the way
+    while (!m_timers.empty()) {
+        auto top = m_timers.top();
+
+        if (top->cancelled) {
+            m_timers.pop();
+            continue;
+        }
+
+        if (top->expiration > now) {
+            break;
+        }
+
+        expired.push_back(top);
+        m_activeTimers.erase(top->id);
+        m_timers.pop();
     }
 
-    // 2. Execute callbacks
+    // Process callbacks
     for (auto& t : expired) {
-        if (t.callback) {
-            t.callback();
+        if (!t->cancelled && t->callback) {
+            t->callback();
         }
 
-        // 3. Re-schedule if repeating
-        if (t.repeat) {
-            t.expiration += t.interval;
-            insertTimer(t);
+        // Reschedule repeating timers if not cancelled
+        if (t->repeat && !t->cancelled) {
+            auto newTimer = std::make_shared<Timer>(Timer{
+                t->expiration + t->interval,
+                t->interval,
+                t->callback,
+                t->id,
+                true,
+                false
+            });
+            insertTimer(newTimer);
         }
     }
 
-    // 4. Ensure hardware timer waits for the next valid event
+    // Ensure hardware timer waits for the next valid event
     resetTimerFd();
 }
 

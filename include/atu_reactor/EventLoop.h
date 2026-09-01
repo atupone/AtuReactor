@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <set>
+#include <queue>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -80,7 +80,6 @@ using EventCallbackFn = void(*)(void* context, uint32_t events);
  */
 class ATU_API EventLoop {
     public:
-        // Callback signature: takes a uint32_t representing the triggered epoll events.
         using TimerCallback = std::function<void()>;
 
         /**
@@ -93,11 +92,17 @@ class ATU_API EventLoop {
         ~EventLoop();
 
         /**
-         * @brief Registers a file descriptor and a callback to the event loop.
-         * @param fd The file descriptor to monitor (must be unique).
-         * @param eventMask The epoll events to watch for (e.g., EPOLLIN, EPOLLET).
-         * @param cb The function to execute when the event triggers.
-         * @throws std::runtime_error if the OS fails to add the source.
+         * @brief Registers a file descriptor and its event handler with the event loop.
+         *
+         * Configures the underlying epoll instance to monitor @p fd for the requested
+         * events and maps it to the provided @p handler.
+         *
+         * @param fd The file descriptor to monitor. Must be valid, open, and not already registered.
+         * @param eventMask Bitmask of epoll events to watch for (e.g., `EPOLLIN`, `EPOLLOUT`, `EPOLLET`).
+         * @param handler The callback function to execute when a matching event occurs.
+         *
+         * @return Result<void> Success status (`Result::ok()`), or an error payload detailing
+         *         the registration failure (e.g., `EEXIST` if @p fd is already registered, `EBADF` if invalid).
          */
         Result<void> addSource(int fd, uint32_t eventMask, InternalHandler handler);
 
@@ -108,17 +113,45 @@ class ATU_API EventLoop {
         Result<void> removeSource(int fd);
 
         /**
-         * @brief Registers a generic stream-based file descriptor (TCP, Pipe, etc.) with the loop.
-         * * This adds the file descriptor to the epoll interest list. When the descriptor becomes
-         * readable (EPOLLIN), the provided callback is executed within the EventLoop thread.
-         * * @param fd The file descriptor to monitor. Must be valid and non-blocking.
-         * @param callback The function to execute when data is available to read.
-         * @return Result<void> Success, or an error code if the FD is out of range or epoll fails.
-         * * @note If fd < 1024, it uses fast direct-indexing storage. Otherwise, it uses a map.
-         * @warning The callback is executed on the EventLoop thread. Avoid blocking operations.
+         * @brief Registers a stream-based file descriptor (e.g., TCP socket, pipe) with the event loop.
+         *
+         * Adds @p fd to the underlying epoll interest list for read events (`EPOLLIN`). When the descriptor
+         * becomes readable, @p callback is invoked on the event loop thread.
+         *
+         * @param fd The file descriptor to monitor. Must be valid, open, and configured as non-blocking.
+         * @param callback The function to execute when data is available. Receives event flags and @p context.
+         * @param context User data pointer passed directly to @p callback on invocation. May be `nullptr`.
+         *
+         * @return Result<void> Success (`Result::ok()`), or an error payload if registration fails
+         *         (e.g., duplicate registration or `epoll_ctl` failure).
+         *
+         * @note FDs with values lower than 1024 use direct array indexing for low-latency dispatch;
+         *       larger FDs fall back to hash map storage.
+         * @warning @p callback runs directly on the event loop thread. Do not perform blocking operations
+         *          inside the callback.
          */
         Result<void> addStreamSource(int fd, std::function<void(uint32_t, void*)> callback, void* context);
+        /**
+         * @brief Modifies the epoll event mask for an already-registered stream source.
+         *
+         * Adjusts the monitored events for @p fd by appending or combining @p extraEvents
+         * with the existing event configuration.
+         *
+         * @param fd The file descriptor to modify. Must already be registered via addStreamSource().
+         * @param extraEvents Additional epoll event flags to watch for (e.g., `EPOLLOUT`, `EPOLLET`).
+         *
+         * @return Result<void> Success (`Result::ok()`), or an error if @p fd is not found or `epoll_ctl` fails.
+         */
         Result<void> modifyStreamSource(int fd, uint32_t extraEvents);
+        /**
+         * @brief Unregisters a stream file descriptor from the event loop.
+         *
+         * Removes @p fd from the epoll interest list and cleans up its associated handler storage.
+         *
+         * @param fd The file descriptor to remove.
+         *
+         * @return Result<void> Success (`Result::ok()`), or an error if @p fd was not registered.
+         */
         Result<void> removeStreamSource(int fd);
 
         /**
@@ -162,18 +195,25 @@ class ATU_API EventLoop {
             TimerCallback callback;
             TimerId id;
             bool repeat;
+            bool cancelled{false}; // Used for lazy deletion
+        };
 
-            // Sorting for std::set (earliest time first)
-            bool operator<(const Timer& other) const {
-                if (expiration != other.expiration)
-                    return expiration < other.expiration;
-                return id < other.id;
+        // Shared pointer wrapper for storage stability across moves in priority_queue
+        using TimerPtr = std::shared_ptr<Timer>;
+
+        // Comparator for min-heap (earliest expiration on top)
+        struct TimerComparator {
+            bool operator()(const TimerPtr& a, const TimerPtr& b) const {
+                if (a->expiration != b->expiration) {
+                    return a->expiration > b->expiration; // Min-heap: lower time gets priority
+                }
+                return a->id > b->id;
             }
         };
 
         void handleTimerRead();
         void resetTimerFd();
-        void insertTimer(Timer t);
+        void insertTimer(TimerPtr t);
 
         static constexpr int MAX_EVENTS = 128; // Buffer size for events returned per wait
 
@@ -196,11 +236,11 @@ class ATU_API EventLoop {
         Source m_fastSources[MAX_FAST_FDS];
         std::unordered_map<int, Source> m_slowSources;
 
-        // Ordered queue of pending timers
-        std::set<Timer> m_timers;
+        // Min-heap container over std::vector
+        std::priority_queue<TimerPtr, std::vector<TimerPtr>, TimerComparator> m_timers;
 
-        // Map ID -> Iterator (for fast cancellation O(log N))
-        std::unordered_map<TimerId, std::set<Timer>::iterator> m_activeTimers;
+        // O(1) direct reference map to flag cancellations
+        std::unordered_map<TimerId, TimerPtr> m_activeTimers;
 
         uint64_t m_nextTimerId = 1;
 };
