@@ -30,7 +30,7 @@ TEST(TcpMessagingTest, HandlesCongestionWithBuffer) {
     uint16_t port = ntohs(addr.sin_port);
 
     // 2. Start Connect
-    client.connect("127.0.0.1", port, [](const uint8_t*, size_t) {});
+    client.connect("127.0.0.1", port, [](std::string_view) {});
 
     // 3. Accept the connection
     int accepted_fd = accept(server_fd, nullptr, nullptr);
@@ -91,7 +91,7 @@ TEST(TcpMessagingTest, EpollOutDoesNotSpinOnIdle) {
     uint16_t port = ntohs(addr.sin_port);
 
     // 2. Connect the client
-    client.connect("127.0.0.1", port, [](const uint8_t*, size_t) {});
+    client.connect("127.0.0.1", port, [](std::string_view) {});
     int accepted_fd = accept(server_fd, nullptr, nullptr);
     fcntl(accepted_fd, F_SETFL, fcntl(accepted_fd, F_GETFL, 0) | O_NONBLOCK);
 

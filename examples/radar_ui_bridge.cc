@@ -42,8 +42,7 @@ int main() {
     auto uiBridge = std::make_shared<TcpMessaging>(loop);
 
     // Connect to a local server (e.g., a Python script or 'nc -l 9000')
-    uiBridge->connect("127.0.0.1", 9000, [](const uint8_t* data, size_t len) {
-        std::string cmd(reinterpret_cast<const char*>(data), len);
+    uiBridge->connect("127.0.0.1", 9000, [](std::string_view cmd) {
         std::cout << "[UI -> Bridge] Received command: " << cmd << std::endl;
     });
 

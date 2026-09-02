@@ -128,18 +128,19 @@ namespace atu_reactor {
     }
 
     void TcpMessaging::handleRead() {
-        uint8_t buffer[4096];
+        char buffer[4096];
         ssize_t n = ::read(m_fd, buffer, sizeof(buffer));
-
-        if (n > 0) {
-            if (m_onData) m_onData(buffer, static_cast<size_t>(n));
+        if (n > 0) [[likely]] {
+            if (m_onData) [[likely]] {
+                m_onData(std::string_view(buffer, static_cast<size_t>(n)));
+            }
         } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             forceClose(); // Connection closed by peer or read error
         }
     }
 
     void TcpMessaging::send(std::string_view data) {
-        if (m_closed || m_fd < 0) {
+        if (m_closed || m_fd < 0) [[unlikely]] {
             return;
         }
 
@@ -159,7 +160,7 @@ namespace atu_reactor {
         if (n < static_cast<ssize_t>(data.length())) {
             size_t written = (n < 0) ? 0 : static_cast<size_t>(n);
 
-            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) [[unlikely]] {
                 forceClose();
                 return;
             }

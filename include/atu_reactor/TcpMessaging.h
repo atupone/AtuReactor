@@ -21,6 +21,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Library headers
 #include <atu_reactor/EventLoop.h>
@@ -31,10 +32,16 @@ namespace atu_reactor {
 class ATU_API TcpMessaging {
     public:
         // Callback provides the raw bytes and the number of bytes received
-        using DataCallback = std::function<void(const uint8_t* data, size_t len)>;
+        using DataCallback = std::function<void(std::string_view data)>;
 
-        TcpMessaging(EventLoop& loop);
+        explicit TcpMessaging(EventLoop& loop);
         ~TcpMessaging();
+
+        // Non-copyable, non-movable
+        TcpMessaging(const TcpMessaging&) = delete;
+        TcpMessaging& operator=(const TcpMessaging&) = delete;
+        TcpMessaging(TcpMessaging&&) = delete;
+        TcpMessaging& operator=(TcpMessaging&&) = delete;
 
         /**
          * @brief Connects to a server asynchronously.
@@ -54,7 +61,7 @@ class ATU_API TcpMessaging {
          */
         void close();
 
-        bool isConnected() const { return m_connected; }
+        [[nodiscard]] bool isConnected() const noexcept { return m_connected; }
 
     private:
         // The static bridge that matches the EventLoop's StreamTag signature
@@ -66,12 +73,12 @@ class ATU_API TcpMessaging {
         void forceClose();
 
         EventLoop& m_loop;
-        int m_fd = -1;
+        int m_fd{-1};
         DataCallback m_onData;
         std::vector<uint8_t> m_writeBuffer;
 
-        bool m_connected = false;
-        bool m_closed = true;
+        bool m_connected{false};
+        bool m_closed{true};
 };
 
 }  // namespace atu_reactor
