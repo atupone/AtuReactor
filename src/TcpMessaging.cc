@@ -32,15 +32,19 @@ namespace atu_reactor {
     TcpMessaging::TcpMessaging(EventLoop& loop) : m_loop(loop) {}
 
     TcpMessaging::~TcpMessaging() {
-        close();
+        forceClose();
     }
 
     void TcpMessaging::connect(const std::string& ip, uint16_t port, DataCallback onData) {
+        // Close any existing connection first
+        forceClose();
+
         m_onData = std::move(onData);
 
-        struct addrinfo hints{}, *resInfo;
+        struct addrinfo hints{}, *resInfo = nullptr;
         hints.ai_family = AF_UNSPEC;     // Allow IPv4 or IPv6
         hints.ai_socktype = SOCK_STREAM;
+
         if (getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints, &resInfo) != 0) {
             return;
         }
@@ -56,14 +60,15 @@ namespace atu_reactor {
         m_closed = false;
 
         // Set non-blocking so the EventLoop never stalls
-        fcntl(m_fd, F_SETFL, fcntl(m_fd, F_GETFL, 0) | O_NONBLOCK);
+        int flags = fcntl(m_fd, F_GETFL, 0);
+        fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
 
         // Start Async Connect
         int res = ::connect(m_fd, resInfo->ai_addr, resInfo->ai_addrlen);
         freeaddrinfo(resInfo);
 
-        if ((res != 0) && (errno != EINPROGRESS)) {
-            close();
+        if (res != 0 && errno != EINPROGRESS) {
+            forceClose();
             return;
         }
 
@@ -72,14 +77,24 @@ namespace atu_reactor {
 
         if (res == 0) {
             m_connected = true;
+            m_loop.modifyStreamSource(m_fd, EPOLLIN);
         } else {
             // Handshake in progress: MUST listen for EPOLLOUT to know when it finishes
-            m_loop.modifyStreamSource(m_fd, EPOLLOUT);
+            m_loop.modifyStreamSource(m_fd, EPOLLIN | EPOLLOUT);
         }
     }
 
     void TcpMessaging::onEvent(uint32_t events, void* context) {
         auto* self = static_cast<TcpMessaging*>(context);
+
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            if (!self->m_connected) {
+                self->handleConnect();
+            } else {
+                self->forceClose();
+            }
+            return;
+        }
 
         if (events & EPOLLOUT) {
             if (!self->m_connected) {
@@ -97,18 +112,19 @@ namespace atu_reactor {
     void TcpMessaging::handleConnect() {
         int error = 0;
         socklen_t len = sizeof(error);
-        getsockopt(m_fd, SOL_SOCKET, SO_ERROR, &error, &len);
-
-        if (error == 0) {
-            m_connected = true;
-            // Stop listening for EPOLLOUT now that we are connected,
-            // unless a send() queued data while the handshake was happening.
-            if (m_writeBuffer.empty()) {
-                m_loop.modifyStreamSource(m_fd, 0);
-            }
-        } else {
-            close(); // Connection failed
+        if (getsockopt(m_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+            forceClose(); // Connection failed
+            return;
         }
+
+        m_connected = true;
+
+        // Keep EPOLLIN enabled, disable EPOLLOUT unless we have pending buffered writes
+        uint32_t events = EPOLLIN;
+        if (!m_writeBuffer.empty()) {
+            events |= EPOLLOUT;
+        }
+        m_loop.modifyStreamSource(m_fd, events);
     }
 
     void TcpMessaging::handleRead() {
@@ -117,14 +133,14 @@ namespace atu_reactor {
 
         if (n > 0) {
             if (m_onData) m_onData(buffer, static_cast<size_t>(n));
-        } else if (n == 0 || (n < 0 && errno != EAGAIN)) {
-            close(); // Connection lost or error
+        } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            forceClose(); // Connection closed by peer or read error
         }
     }
 
     void TcpMessaging::send(std::string_view data) {
-        if (m_closed) {
-            return; // Socket must at least exist
+        if (m_closed || m_fd < 0) {
+            return;
         }
 
         // If we already have a buffer, append to it to preserve order
@@ -133,31 +149,35 @@ namespace atu_reactor {
 
             // Ensure we are registered for EPOLLOUT so we know when
             // the connection finishes or the buffer can be drained
-            m_loop.modifyStreamSource(m_fd, EPOLLOUT);
+            m_loop.modifyStreamSource(m_fd, EPOLLIN | EPOLLOUT);
             return;
         }
 
         // Try direct write only if connected and buffer is empty
         ssize_t n = ::write(m_fd, data.data(), data.length());
 
-        if (n < (ssize_t)data.length()) {
-            size_t written = (n < 0) ? 0 : (size_t)n;
+        if (n < static_cast<ssize_t>(data.length())) {
+            size_t written = (n < 0) ? 0 : static_cast<size_t>(n);
 
-            if (n < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                close(); // Error occurred, shut down the connection
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                forceClose();
                 return;
             }
 
             // Socket is full! Store the remainder and ask for EPOLLOUT
             m_writeBuffer.insert(m_writeBuffer.end(), data.begin() + written, data.end());
-            m_loop.modifyStreamSource(m_fd, EPOLLOUT);
+            m_loop.modifyStreamSource(m_fd, EPOLLIN | EPOLLOUT);
         }
     }
 
     void TcpMessaging::handleWrite() {
         if (m_writeBuffer.empty()) {
             // Clear EPOLLOUT if we get stuck in a state with an empty buffer
-            m_loop.modifyStreamSource(m_fd, 0);
+            if (m_closed) {
+                forceClose();
+            } else {
+                m_loop.modifyStreamSource(m_fd, EPOLLIN);
+            }
             return;
         }
 
@@ -165,6 +185,9 @@ namespace atu_reactor {
 
         if (n > 0) {
             m_writeBuffer.erase(m_writeBuffer.begin(), m_writeBuffer.begin() + n);
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            forceClose();
+            return;
         }
 
         if (m_writeBuffer.empty()) {
@@ -174,7 +197,7 @@ namespace atu_reactor {
                 forceClose();
             } else {
                 // Normal operation: just stop asking for EPOLLOUT
-                m_loop.modifyStreamSource(m_fd, 0);
+                m_loop.modifyStreamSource(m_fd, EPOLLIN);
             }
         }
     }
@@ -197,8 +220,7 @@ namespace atu_reactor {
         // We let handleWrite() finish the buffer.
     }
 
-    void TcpMessaging::forceClose()
-    {
+    void TcpMessaging::forceClose() {
         if (m_fd >= 0) {
             m_loop.removeStreamSource(m_fd);
             ::close(m_fd);
