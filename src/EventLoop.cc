@@ -226,7 +226,9 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
                     handleTimerRead();
                 },
                 [](const UDPReceiverTag& tag) {
-                    tag.receiver->handleRead(tag.fd, tag.userContext, tag.handler);
+                    if (tag.receiver) {
+                        tag.receiver->handleRead(tag.fd, tag.userContext, tag.handler);
+                    }
                 },
                 [events](const StreamTag& tag) {
                     if (tag.callback)
@@ -409,7 +411,7 @@ void EventLoop::handleTimerRead() {
             // Check if callback itself cancelled the periodic timer during execution
             if (m_activeTimers.count(t.id)) {
                 t.expiration += t.interval;
-                insertTimer(t); // Reschedule by pushing the modified value back
+                m_timers.push(t); // Direct push avoids duplicate resetTimerFd() syscalls
             }
         }
     }
