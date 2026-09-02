@@ -22,6 +22,7 @@
 #include <map>
 #include <sys/socket.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Library headers
@@ -102,7 +103,7 @@ class ATU_API PacketReceiver {
         std::thread::id m_ownerThreadId; // Added for thread-safety asserts
 
         // Maps port -> ScopedFd. RAII ensures sockets close on removal.
-        std::map<uint16_t, ScopedFd> m_port_to_fd_map;
+        std::unordered_map<uint16_t, ScopedFd> m_port_to_fd_map;
 
         /**
          * Memory structures for recvmmsg.
