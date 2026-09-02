@@ -51,16 +51,6 @@ UDPReceiver::UDPReceiver(EventLoop& loopRef, ReceiverConfig config)
 }
 
 Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn handler) {
-    if (auto baseRes = PacketReceiver::subscribe(port, context, handler); !baseRes.has_value()) {
-        return Result<int>(baseRes.error());
-    }
-
-    // Helper lambda to clean up base subscription on failure
-    auto failWith = [this, port](std::error_code ec) -> Result<int> {
-        (void)PacketReceiver::unsubscribe(port);
-        return ec;
-    };
-
     // Attempt IPv6 Dual-Stack Socket
     int raw_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     bool isV6 = true;
@@ -73,23 +63,24 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
 
     if (raw_fd < 0) {
         // Here the OS will naturally return EMFILE if the real limit is hit
-        return failWith(std::error_code(errno, std::system_category()));
+        return std::error_code(errno, std::system_category());
     }
 
     // Immediately wrap in your ScopedFd for RAII safety
     ScopedFd udp_socket(raw_fd);
 
     // Reuse Address: Allows immediate restart of the application
-    if (int optval = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        return failWith(std::error_code(errno, std::system_category()));
+    int optval = 1;
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+        return std::error_code(errno, std::system_category());
     }
 
-    if (int reusePort = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
-        return failWith(std::error_code(errno, std::system_category()));
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
+        return std::error_code(errno, std::system_category());
     }
 
-    if (int enabled = 1; setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
-        return failWith(std::error_code(errno, std::system_category()));
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &optval, sizeof(optval)) < 0) {
+        return std::error_code(errno, std::system_category());
     }
 
     if (isV6) {
@@ -103,23 +94,24 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         addr6.sin6_addr = in6addr_any;
 
         if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr6), sizeof(addr6)) == -1) {
-            return failWith(std::error_code(errno, std::system_category()));
+            return std::error_code(errno, std::system_category());
         }
     } else {
         struct sockaddr_in addr4{};
         addr4.sin_family = AF_INET;
         addr4.sin_port = htons(port);
-        addr4.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
+        addr4.sin_addr.s_addr = INADDR_ANY;
 
         if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr4), sizeof(addr4)) == -1) {
-            return failWith(std::error_code(errno, std::system_category()));
+            return std::error_code(errno, std::system_category());
         }
     }
 
     // Resolve the actual port (Crucial for port 0)
     struct sockaddr_storage ss;
-    if (socklen_t len = sizeof(ss); getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
-        return failWith(std::error_code(errno, std::system_category()));
+    socklen_t len = sizeof(ss);
+    if (getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
+        return std::error_code(errno, std::system_category());
     }
 
     uint16_t localPort = (ss.ss_family == AF_INET6)
@@ -127,6 +119,10 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         : ntohs(reinterpret_cast<struct sockaddr_in*>(&ss)->sin_port);
 
     // Register with the EventLoop using your custom Tag
+    if (auto baseRes = PacketReceiver::subscribe(localPort, context, handler); !baseRes.has_value()) {
+        return Result<int>(baseRes.error());
+    }
+
     auto regResult = m_loop.addSource(udp_socket, EPOLLIN, UDPReceiverTag{
         this,
         (int)udp_socket,
@@ -137,7 +133,8 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     if (!regResult) {
         // If epoll registration fails, ScopedFd will automatically close the socket
         // when we return the error here.
-        return failWith(regResult.error());
+        (void)PacketReceiver::unsubscribe(localPort);
+        return regResult.error();
     }
 
     // Move ownership of ScopedFd to our map only after success
