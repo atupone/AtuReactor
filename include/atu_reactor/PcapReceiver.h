@@ -209,8 +209,10 @@ class ATU_API PcapReceiver : public PacketReceiver {
         bool m_swapped = false;
         bool m_isNanosecond = false;
 
+        static constexpr size_t MAX_INTERFACES = 16;
+
         // Maps Interface ID (index in file) to its metadata
-        std::unordered_map<uint32_t, InterfaceInfo> m_interfaces;
+        std::array<InterfaceInfo, MAX_INTERFACES> m_interfaces;
         uint32_t m_interfaceCount = 0;
 
         bool m_isPcapNg = true;

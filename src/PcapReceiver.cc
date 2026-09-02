@@ -321,6 +321,12 @@ bool PcapReceiver::stepPcapNg() noexcept {
         }
 
         if (type == PCAPNG_IDB) {
+            if (m_interfaceCount >= MAX_INTERFACES) [[unlikely]] {
+                // Ignore interfaces beyond limit or handle accordingly
+                m_currentPtr += len;
+                continue;
+            }
+
             auto* idb = reinterpret_cast<const PcapNgIDBBody*>(m_currentPtr + sizeof(PcapNgBlockHeader));
             InterfaceInfo info;
             info.linkType = m_swapped ? __builtin_bswap16(idb->linkType) : idb->linkType;
@@ -354,6 +360,10 @@ bool PcapReceiver::stepPcapNg() noexcept {
 
     auto* epb = reinterpret_cast<const PcapNgEPBBody*>(m_currentPtr + sizeof(PcapNgBlockHeader));
     uint32_t ifId = m_swapped ? __builtin_bswap32(epb->interfaceId) : epb->interfaceId;
+
+    if (ifId >= m_interfaceCount) [[unlikely]] {
+        return false; // Invalid interface ID
+    }
 
     auto& info = m_interfaces[ifId]; // Assuming IDB appeared before EPB
     uint64_t high = m_swapped ? __builtin_bswap32(epb->timestampHigh) : epb->timestampHigh;
