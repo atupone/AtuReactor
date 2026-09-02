@@ -21,6 +21,7 @@
 #include <atu_reactor/PacketReceiver.h>
 
 // System headers
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <sys/types.h>
@@ -195,7 +196,8 @@ class ATU_API PcapReceiver : public PacketReceiver {
             void* context = nullptr;
             PacketHandlerFn handler = nullptr;
         };
-        std::unique_ptr<Subscription[]> m_portTable;
+        // Stack/Heap flat fixed array for O(1) direct network-port lookups
+        std::array<Subscription, 65536> m_portTable{};
 
         // Timing state
         struct timespec m_pcapStartTs = {0, 0}; // TS of first packet in file

@@ -47,7 +47,6 @@ namespace atu_reactor {
 
 PcapReceiver::PcapReceiver(EventLoop& loopRef, PcapConfig config)
         : PacketReceiver(loopRef, config), m_pcapConfig(config),
-        m_portTable(std::make_unique<Subscription[]>(65536)),
         m_finished(false)
 {
 }
@@ -187,7 +186,18 @@ Result<void> PcapReceiver::unsubscribe(uint16_t port) {
         return baseResult;
     }
 
-    m_portTable[port] = {};
+    // Convert to Network Byte Order ONCE
+    uint16_t netPort = htons(port);
+
+    m_portTable[netPort] = {};
+
+    // Clear hot cache if this port was cached
+    if (m_hotPort == netPort) {
+        m_hotPort = 0;
+        m_hotHandler = nullptr;
+        m_hotContext = nullptr;
+    }
+
     return Result<void>::success();
 }
 
