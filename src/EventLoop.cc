@@ -237,17 +237,18 @@ Result<void> EventLoop::runOnce(int timeoutMs) {
         }
     }
 
-    // Execute Pending Tasks
-    // We swap to a local vector to handle re-entrant calls safely.
-    if (!m_pendingTasks.empty()) {
-        std::vector<Task> tasks;
-        tasks.swap(m_pendingTasks);
+    // Execute Pending Tasks using double-buffering
+    if (!m_pendingTasks.empty() && !m_isProcessingTasks) {
+        m_isProcessingTasks = true;
 
-        for (const auto& task : tasks) {
+        m_processingTasks.clear(); // Resets size to 0 while keeping allocated capacity
+        m_processingTasks.swap(m_pendingTasks);
+
+        for (const auto& task : m_processingTasks)
             task();
-        }
-    }
 
+        m_isProcessingTasks = false;
+    }
 
     // Final success return to satisfy the Result<void> return type
     return Result<void>::success();

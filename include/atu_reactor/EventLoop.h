@@ -238,6 +238,8 @@ class ATU_API EventLoop {
 
         // Queue for deferred execution
         std::vector<Task> m_pendingTasks;
+        std::vector<Task> m_processingTasks;
+        bool m_isProcessingTasks{false};
 
         // Hybrid storage to prevent massive allocations on high FD numbers
         static constexpr int MAX_FAST_FDS = 1024; // Limit for direct indexing
