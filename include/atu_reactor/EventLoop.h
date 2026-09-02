@@ -23,6 +23,7 @@
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -207,26 +208,20 @@ class ATU_API EventLoop {
             Duration interval; // Zero if one-shot
             Task task;
             TimerId id;
-            bool repeat;
-            bool cancelled{false}; // Used for lazy deletion
-        };
+            bool repeat{false};
 
-        // Shared pointer wrapper for storage stability across moves in priority_queue
-        using TimerPtr = std::shared_ptr<Timer>;
-
-        // Comparator for min-heap (earliest expiration on top)
-        struct TimerComparator {
-            bool operator()(const TimerPtr& a, const TimerPtr& b) const {
-                if (a->expiration != b->expiration) {
-                    return a->expiration > b->expiration; // Min-heap: lower time gets priority
+            // Comparator for min-heap (earliest expiration on top)
+            bool operator>(const Timer& other) const noexcept {
+                if (expiration != other.expiration) {
+                    return expiration > other.expiration; // Min-heap: lower time gets priority
                 }
-                return a->id > b->id;
+                return id > other.id;
             }
         };
 
         void handleTimerRead();
         void resetTimerFd();
-        void insertTimer(TimerPtr t);
+        void insertTimer(const Timer& t);
 
         static constexpr int MAX_EVENTS = 128; // Buffer size for events returned per wait
 
@@ -250,10 +245,10 @@ class ATU_API EventLoop {
         std::unordered_map<int, Source> m_slowSources;
 
         // Min-heap container over std::vector
-        std::priority_queue<TimerPtr, std::vector<TimerPtr>, TimerComparator> m_timers;
+        std::priority_queue<Timer, std::vector<Timer>, std::greater<Timer>> m_timers;
 
-        // O(1) direct reference map to flag cancellations
-        std::unordered_map<TimerId, TimerPtr> m_activeTimers;
+        // Set of active Timer IDs for O(1) existence checks & lazy deletion
+        std::unordered_set<TimerId> m_activeTimers;
 
         uint64_t m_nextTimerId = 1;
 };

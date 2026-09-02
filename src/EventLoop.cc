@@ -264,7 +264,7 @@ Result<TimerId> EventLoop::runAfter(Duration delay, TaskCallbackFn fn, void* con
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + delay;
-    auto t = std::make_shared<Timer>(Timer{when, Duration(0), Task{fn, context}, id, false, false});
+    Timer t{when, Duration(0), Task{fn, context}, id, false};
 
     insertTimer(t);
 
@@ -279,7 +279,7 @@ Result<TimerId> EventLoop::runEvery(Duration interval, TaskCallbackFn fn, void* 
 
     TimerId id = m_nextTimerId++;
     Timestamp when = Clock::now() + interval;
-    auto t = std::make_shared<Timer>(Timer{when, interval, Task{fn, context}, id, true, false});
+    Timer t{when, interval, Task{fn, context}, id, true};
 
     insertTimer(t);
 
@@ -288,14 +288,12 @@ Result<TimerId> EventLoop::runEvery(Duration interval, TaskCallbackFn fn, void* 
 
 Result<void> EventLoop::cancelTimer(TimerId id) {
     auto it = m_activeTimers.find(id);
-
     if (it == m_activeTimers.end()) [[unlikely]] {
         // Return an error if the TimerId was not found
         return std::error_code(ENOENT, std::system_category());
     }
 
-    // Lazy Deletion: mark the timer as cancelled in O(1)
-    it->second->cancelled = true;
+    // Lazy Deletion: Simply remove the ID from the active set
     m_activeTimers.erase(it);
 
     // If we removed the earliest timer, we must update the hardware timer
@@ -305,19 +303,15 @@ Result<void> EventLoop::cancelTimer(TimerId id) {
     return Result<void>::success();
 }
 
-void EventLoop::insertTimer(TimerPtr t) {
-    bool earliestChanged = false;
-
+void EventLoop::insertTimer(const Timer& t) {
     // Purge cancelled elements from top before checking earliest
-    while (!m_timers.empty() && m_timers.top()->cancelled) {
+    while (!m_timers.empty() && !m_activeTimers.count(m_timers.top().id)) {
         m_timers.pop();
     }
 
-    if (m_timers.empty() || t->expiration < m_timers.top()->expiration) {
-        earliestChanged = true;
-    }
+    bool earliestChanged = m_timers.empty() || t.expiration < m_timers.top().expiration;
 
-    m_activeTimers[t->id] = t;
+    m_activeTimers.insert(t.id);
     m_timers.push(t);
 
     if (earliestChanged) {
@@ -327,7 +321,7 @@ void EventLoop::insertTimer(TimerPtr t) {
 
 void EventLoop::resetTimerFd() {
     // Purge cancelled items from the top of the min-heap
-    while (!m_timers.empty() && m_timers.top()->cancelled) {
+    while (!m_timers.empty() && !m_activeTimers.count(m_timers.top().id)) {
         m_timers.pop();
     }
 
@@ -339,7 +333,7 @@ void EventLoop::resetTimerFd() {
     }
 
     auto now = Clock::now();
-    auto expiration = m_timers.top()->expiration;
+    auto expiration = m_timers.top().expiration;
 
     struct itimerspec newValue{};
 
@@ -377,43 +371,45 @@ void EventLoop::handleTimerRead() {
     // Iterating while modifying requires care.
 
     // Extract all expired timers from the set
-    std::vector<TimerPtr> expired;
+    std::vector<Timer> expired; // Store by value
 
     // Pop all expired timers, discarding any cancelled ones along the way
     while (!m_timers.empty()) {
-        auto top = m_timers.top();
+        Timer top = m_timers.top(); // Copy the top element
 
-        if (top->cancelled) {
+        if (!m_activeTimers.count(top.id)) {
             m_timers.pop();
             continue;
         }
 
-        if (top->expiration > now) {
+        if (top.expiration > now) {
             break;
         }
 
         expired.push_back(top);
-        m_activeTimers.erase(top->id);
         m_timers.pop();
     }
 
     // Process callbacks
     for (auto& t : expired) {
-        if (!t->cancelled) {
-            t->task();
+        // Check if the timer was cancelled right before execution (e.g. by a previous callback)
+        if (!m_activeTimers.count(t.id)) {
+            continue;
         }
 
-        // Reschedule repeating timers if not cancelled
-        if (t->repeat && !t->cancelled) {
-            auto newTimer = std::make_shared<Timer>(Timer{
-                t->expiration + t->interval,
-                t->interval,
-                t->task,
-                t->id,
-                true,
-                false
-            });
-            insertTimer(newTimer);
+        // Remove one-shot timers from active set; keep periodic ones in active set during execution
+        if (!t.repeat) {
+            m_activeTimers.erase(t.id);
+        }
+
+        t.task(); // Execute
+
+        if (t.repeat) {
+            // Check if callback itself cancelled the periodic timer during execution
+            if (m_activeTimers.count(t.id)) {
+                t.expiration += t.interval;
+                insertTimer(t); // Reschedule by pushing the modified value back
+            }
         }
     }
 
