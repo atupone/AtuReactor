@@ -55,6 +55,12 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         return Result<int>(baseRes.error());
     }
 
+    // Helper lambda to clean up base subscription on failure
+    auto failWith = [this, port](std::error_code ec) -> Result<int> {
+        (void)PacketReceiver::unsubscribe(port);
+        return ec;
+    };
+
     // Attempt IPv6 Dual-Stack Socket
     int raw_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     bool isV6 = true;
@@ -67,7 +73,7 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
 
     if (raw_fd < 0) {
         // Here the OS will naturally return EMFILE if the real limit is hit
-        return std::error_code(errno, std::system_category());
+        return failWith(std::error_code(errno, std::system_category()));
     }
 
     // Immediately wrap in your ScopedFd for RAII safety
@@ -75,15 +81,15 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
 
     // Reuse Address: Allows immediate restart of the application
     if (int optval = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        return std::error_code(errno, std::system_category());
+        return failWith(std::error_code(errno, std::system_category()));
     }
 
     if (int reusePort = 1; setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
-        return std::error_code(errno, std::system_category());
+        return failWith(std::error_code(errno, std::system_category()));
     }
 
     if (int enabled = 1; setsockopt(udp_socket, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0) {
-        return std::error_code(errno, std::system_category());
+        return failWith(std::error_code(errno, std::system_category()));
     }
 
     if (isV6) {
@@ -97,7 +103,7 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         addr6.sin6_addr = in6addr_any;
 
         if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr6), sizeof(addr6)) == -1) {
-            return std::error_code(errno, std::system_category());
+            return failWith(std::error_code(errno, std::system_category()));
         }
     } else {
         struct sockaddr_in addr4{};
@@ -106,14 +112,14 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
         addr4.sin_addr.s_addr = INADDR_ANY; // Listen on all available interfaces
 
         if (::bind(udp_socket, reinterpret_cast<struct sockaddr*>(&addr4), sizeof(addr4)) == -1) {
-            return std::error_code(errno, std::system_category());
+            return failWith(std::error_code(errno, std::system_category()));
         }
     }
 
     // Resolve the actual port (Crucial for port 0)
     struct sockaddr_storage ss;
     if (socklen_t len = sizeof(ss); getsockname(udp_socket, reinterpret_cast<struct sockaddr*>(&ss), &len) == -1) {
-        return std::error_code(errno, std::system_category());
+        return failWith(std::error_code(errno, std::system_category()));
     }
 
     uint16_t localPort = (ss.ss_family == AF_INET6)
@@ -131,7 +137,7 @@ Result<int> UDPReceiver::subscribe(uint16_t port, void* context, PacketHandlerFn
     if (!regResult) {
         // If epoll registration fails, ScopedFd will automatically close the socket
         // when we return the error here.
-        return regResult.error();
+        return failWith(regResult.error());
     }
 
     // Move ownership of ScopedFd to our map only after success
@@ -150,6 +156,7 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
     for (int i = 0; i < m_config.batchSize; ++i) {
         m_msgHeaders[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
         m_msgHeaders[i].msg_hdr.msg_controllen = m_controlBuffers[i].size();
+        m_ioVectors[i].iov_len = m_config.bufferSize;
     }
 
     // recvmmsg allows us to grab up to BATCH_SIZE packets in one go.
@@ -176,7 +183,7 @@ void UDPReceiver::handleRead(int fd, void* context, PacketHandlerFn handler) {
              cmsg = CMSG_NXTHDR(&m_msgHeaders[k].msg_hdr, cmsg)) {
 
             if ((cmsg->cmsg_level == SOL_SOCKET) && (cmsg->cmsg_type == SCM_TIMESTAMPNS)) {
-                packetTime = *(struct timespec*)CMSG_DATA(cmsg);
+                std::memcpy(&packetTime, CMSG_DATA(cmsg), sizeof(struct timespec));
                 break;
             }
         }
