@@ -1,16 +1,18 @@
 # AtuReactor
 
-**AtuReactor** is a lightweight, high-performance Linux-native C++17 library designed for low-latency UDP packet processing. It implements the **Reactor Pattern** to provide an efficient, event-driven architecture.
+**AtuReactor** is a lightweight, high-performance Linux-native C++20 library designed for low-latency networking and packet processing. It implements the **Reactor Pattern** to provide an efficient, event-driven architecture for live UDP/TCP streams and PCAP replay processing.
 
 ---
 
 ## 🚀 Key Features
 
-* **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with $O(1)$ scalability.
+* **C++17 Native**: Modern codebase utilizing `[[likely]]` / `[[unlikely]]` branching hints.
+* **Epoll-based Reactor**: High-efficiency asynchronous I/O multiplexing with O(1) scalability for stream and packet sources.
 * **Batch UDP Reception**: Utilizes `recvmmsg` to pull multiple packets from the kernel in a single system call.
+* **TCP Stream Support**: Integrated `TcpMessaging` class with non-blocking async connect, graceful buffer draining, and zero-copy view dispatch.
 * **Hugepage Support**: Supports `MAP_HUGETLB` via `mmap` to reduce TLB misses and improve deterministic performance under high load.
 * **Precision Kernel Timestamps**: Native support for nanosecond-precision timestamps via `SO_TIMESTAMPNS` and `SO_TIMESTAMPING`.
-* **PCAP Replay Engine**: Native support for replaying network captures through the same event-driven interface, ideal for backtesting.
+* **PCAP / PCAPNG Engine**: Native support for replaying legacy `.pcap` and modern `.pcapng` files with interface resolution and TIMED/FLOOD mode execution.
 * **Dual-Stack IPv6 Support**: Automatically handles both IPv4 and IPv6 traffic on the same port using a single subscription.
 * **Safety & Robustness**: Reports kernel-level events like packet truncation (`MSG_TRUNC`) via a status bitmask.
 * **Cache-Aligned Buffering**: Uses a single contiguous flat buffer with 64-byte alignment to match CPU cache lines.
@@ -42,30 +44,25 @@ AtuReactor provides robust support for nanosecond-precision timestamps to elimin
 
 ### Implementation Details
 * **Dual API Support**: The library parses both `SCM_TIMESTAMPNS` and `SCM_TIMESTAMPING` ancillary data.
-* **Metadata Persistence**: Unlike standard implementations, AtuReactor manually resets `msg_controllen` before every batch read. This prevents the kernel from "shrinking" the metadata buffer, ensuring stable timestamp delivery across packet bursts.
+* **Metadata Persistence**: AtuReactor explicitly resets `msg_controllen` and `iov_len` before every batch read. This prevents the kernel from shrinking the metadata buffer, ensuring stable timestamp delivery across packet bursts.
 * **Control Message Buffering**: Uses pre-allocated, appropriately sized buffers (`CMSG_SPACE`) to store multiple `timespec` structures provided by the kernel.
 
 ---
 
 ## 💻 Quick Start
 
-### 1. Define a Callback
-```cpp
-#include <atu_reactor/UDPReceiver.h>
-#include <iostream>
-
-void onPacketReceived(void* context, const uint8_t* data, size_t size, uint32_t status, struct timespec ts) {
-    if (ts.tv_sec > 0) {
-        std::cout << "Kernel Timestamp: " << ts.tv_sec << "." << ts.tv_nsec << std::endl;
-    }
-    std::cout << "Received " << size << " bytes" << std::endl;
-}
-```
-
-### 2. Live UDP Reception
+### 1. Live UDP Reception
 ```cpp
 #include <atu_reactor/EventLoop.h>
 #include <atu_reactor/UDPReceiver.h>
+#include <iostream>
+
+void onPacketReceived(void* context, std::span<const uint8_t> payload, uint32_t status, struct timespec ts) {
+    if (ts.tv_sec > 0) {
+        std::cout << "Kernel Timestamp: " << ts.tv_sec << "." << ts.tv_nsec << std::endl;
+    }
+    std::cout << "Received " << payload.size() << " bytes" << std::endl;
+}
 
 int main() {
     atu_reactor::EventLoop loop;
@@ -81,8 +78,32 @@ int main() {
 }
 ```
 
-### 3. PCAP Replay Usage
-The `PcapReceiver` allows you to process `.pcap` files using the same callback logic as the live receiver. This allows for seamless transitions between offline analysis and live production code.
+### 2. Asynchronous TCP Messaging
+```cpp
+#include <atu_reactor/EventLoop.h>
+#include <atu_reactor/TcpMessaging.h>
+#include <iostream>
+
+int main() {
+    atu_reactor::EventLoop loop;
+    atu_reactor::TcpMessaging client(loop);
+
+    client.connect("127.0.0.1", 8080, [](std::span<const uint8_t> data) {
+        std::cout << "Received " << data.size() << " bytes from server\n";
+    });
+
+    // Queue string_view or std::span data safely
+    client.send("Hello, Reactor!");
+
+    while (true) {
+        loop.runOnce(1000);
+    }
+    return 0;
+}
+```
+
+### 3. PCAP / PCAPNG Replay Usage
+The `PcapReceiver` processes `.pcap` and `.pcapng` files using the same callback logic as live receivers.
 
 ```cpp
 #include <atu_reactor/PcapReceiver.h>
@@ -91,22 +112,21 @@ The `PcapReceiver` allows you to process `.pcap` files using the same callback l
 int main() {
     atu_reactor::EventLoop loop;
     
-    // Configure replay behavior
-    atu_reactor::PcapConfig config;
-    config.loop = false; // Set to true to restart file at EOF
+    atu_reactor::PcapConfig config{
+        .mode = atu_reactor::ReplayMode::TIMED,
+        .speedMultiplier = 1.0,
+        .batchSize = 1000
+    };
     
     atu_reactor::PcapReceiver reader(loop, config);
-    if (!reader.open("capture.pcap")) {
+    if (!reader.open("capture.pcapng")) {
         return 1;
     }
 
-    // Subscribe to a specific port within the PCAP
     reader.subscribe(12345, nullptr, onPacketReceived);
-    
-    // Begin reading and injecting into the loop
     reader.start();
     
-    while (true) {
+    while (!reader.isFinished()) {
         loop.runOnce(100);
     }
     return 0;
@@ -117,19 +137,21 @@ int main() {
 
 ## 🛡️ Performance & Threading
 
-To achieve maximum deterministic performance, AtuReactor is **Thread-Hostile**:
+To achieve maximum deterministic performance, AtuReactor components are **Thread-Hostile**:
 
 * **No Internal Locking**: Eliminates mutex contention overhead to maintain a low-latency hot path.
-* **Thread Safety**: All methods, including `subscribe` and `handleRead`, must be executed on the same thread that constructed the `UDPReceiver`.
+* **Thread Safety**: All methods must be executed on the same thread that constructed the receiver or event loop.
 * **Safety Assertions**: The library uses thread ID tracking to assert that I/O operations occur on the correct owner thread.
 
 ---
 
 ## ⚙️ Building
 
+Requires a C++20 compliant compiler (GCC 10+, Clang 11+).
+
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
