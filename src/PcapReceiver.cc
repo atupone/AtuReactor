@@ -43,6 +43,13 @@
 #define DLT_LINUX_SLL 113
 #endif
 
+template <typename T>
+[[nodiscard]] inline T maybeSwap(T val, bool swapped) noexcept {
+    if constexpr (sizeof(T) == 2) return swapped ? __builtin_bswap16(val) : val;
+    if constexpr (sizeof(T) == 4) return swapped ? __builtin_bswap32(val) : val;
+    if constexpr (sizeof(T) == 8) return swapped ? __builtin_bswap64(val) : val;
+}
+
 namespace atu_reactor {
 
 PcapReceiver::PcapReceiver(EventLoop& loopRef, PcapConfig config)
@@ -121,25 +128,15 @@ Result<void> PcapReceiver::open(const std::string& path) {
     } else {
         m_isPcapNg = false;
 
-        if (g_hdr->magic_number == MAGIC_MICRO_LE) {
-            m_swapped = true;
-            m_isNanosecond = false;
-        } else if (g_hdr->magic_number == MAGIC_NANO_LE) {
-            m_swapped = true;
-            m_isNanosecond = true;
-        } else if (g_hdr->magic_number == MAGIC_NANO_BE) {
-            m_swapped = false;
-            m_isNanosecond = true;
-        } else if (g_hdr->magic_number == MAGIC_MICRO_BE) {
-            m_swapped = false;
-            m_isNanosecond = false;
+        switch (g_hdr->magic_number) {
+            case MAGIC_MICRO_LE: m_swapped = true;  m_isNanosecond = false; break;
+            case MAGIC_NANO_LE:  m_swapped = true;  m_isNanosecond = true;  break;
+            case MAGIC_NANO_BE:  m_swapped = false; m_isNanosecond = true;  break;
+            case MAGIC_MICRO_BE: m_swapped = false; m_isNanosecond = false; break;
+            default: return std::error_code(EINVAL, std::system_category());
         }
         // Check magic number for byte swapping
-        if (m_swapped) {
-            m_linkType = __builtin_bswap32(g_hdr->network);
-        } else {
-            m_linkType = g_hdr->network;
-        }
+        m_linkType = maybeSwap(g_hdr->network, m_swapped);
 
         // Set cursor to start of first packet
         m_currentPtr += sizeof(pcap_file_header);
@@ -238,22 +235,10 @@ bool PcapReceiver::internalStep() noexcept {
     auto* disk_hdr = reinterpret_cast<const pcap_sf_pkthdr*>(m_currentPtr);
 
     // Read and potentially swap fields
-    uint32_t sec
-        = m_swapped
-        ? __builtin_bswap32(disk_hdr->ts_sec)
-        : disk_hdr->ts_sec;
-    uint32_t fraction
-        = m_swapped
-        ? __builtin_bswap32(disk_hdr->ts_usec)
-        : disk_hdr->ts_usec;
-    uint32_t caplen
-        = m_swapped
-        ? __builtin_bswap32(disk_hdr->caplen)
-        : disk_hdr->caplen;
-    uint32_t len
-        = m_swapped
-        ? __builtin_bswap32(disk_hdr->len)
-        : disk_hdr->len;
+    uint32_t sec      = maybeSwap(disk_hdr->ts_sec,  m_swapped);
+    uint32_t fraction = maybeSwap(disk_hdr->ts_usec, m_swapped);
+    uint32_t caplen   = maybeSwap(disk_hdr->caplen,  m_swapped);
+    uint32_t len      = maybeSwap(disk_hdr->len,     m_swapped);
 
     // Create a compatible in-memory header
     struct timespec ts;
@@ -301,13 +286,8 @@ bool PcapReceiver::stepPcapNg() noexcept {
         }
 
         auto* bh = reinterpret_cast<const PcapNgBlockHeader*>(m_currentPtr);
-        uint32_t type = bh->type;
-        len  = bh->totalLength;
-
-        if (m_swapped) {
-            type = __builtin_bswap32(type);
-            len  = __builtin_bswap32(len);
-        }
+        uint32_t type = maybeSwap(bh->type,        m_swapped);
+        len           = maybeSwap(bh->totalLength, m_swapped);
 
         // Safety check
         if (len < sizeof(PcapNgBlockHeader) || m_currentPtr + len > m_mappedData + m_fileSize) [[unlikely]] {
@@ -329,7 +309,7 @@ bool PcapReceiver::stepPcapNg() noexcept {
 
             auto* idb = reinterpret_cast<const PcapNgIDBBody*>(m_currentPtr + sizeof(PcapNgBlockHeader));
             InterfaceInfo info;
-            info.linkType = m_swapped ? __builtin_bswap16(idb->linkType) : idb->linkType;
+            info.linkType = maybeSwap(idb->linkType, m_swapped);
             info.tsResolutionDivisor = 1000000; // Default to micro (10^6)
 
             // Parse IDB Options for resolution (if_tsresol)
@@ -337,11 +317,15 @@ bool PcapReceiver::stepPcapNg() noexcept {
             const uint8_t* blockEnd = m_currentPtr + len - 4; // last 4 bytes is the length again
 
             while (optPtr + 4 <= blockEnd) {
-                uint16_t code = *reinterpret_cast<const uint16_t*>(optPtr);
-                uint16_t vlen = *reinterpret_cast<const uint16_t*>(optPtr + 2);
-                if (m_swapped) { code = __builtin_bswap16(code); vlen = __builtin_bswap16(vlen); }
-
+                uint16_t code;
+                std::memcpy(&code, optPtr, sizeof(code));
+                code = maybeSwap(code, m_swapped);
                 if (code == 0) break; // End of options
+
+                uint16_t vlen;
+                std::memcpy(&vlen, optPtr + 2, sizeof(code));
+                vlen = maybeSwap(vlen, m_swapped);
+
                 if (code == 9 && vlen == 1) { // if_tsresol
                     uint8_t res = *(optPtr + 4);
                     info.tsResolutionDivisor = (res & 0x80) ? (1ULL << (res & 0x7F)) : 1;
@@ -359,15 +343,15 @@ bool PcapReceiver::stepPcapNg() noexcept {
     }
 
     auto* epb = reinterpret_cast<const PcapNgEPBBody*>(m_currentPtr + sizeof(PcapNgBlockHeader));
-    uint32_t ifId = m_swapped ? __builtin_bswap32(epb->interfaceId) : epb->interfaceId;
+    uint32_t ifId = maybeSwap(epb->interfaceId, m_swapped);
 
     if (ifId >= m_interfaceCount) [[unlikely]] {
         return false; // Invalid interface ID
     }
 
     auto& info = m_interfaces[ifId]; // Assuming IDB appeared before EPB
-    uint64_t high = m_swapped ? __builtin_bswap32(epb->timestampHigh) : epb->timestampHigh;
-    uint64_t low  = m_swapped ? __builtin_bswap32(epb->timestampLow)  : epb->timestampLow;
+    uint64_t high  = maybeSwap(epb->timestampHigh, m_swapped);
+    uint64_t low   = maybeSwap(epb->timestampLow,  m_swapped);
     uint64_t tsRaw = (high << 32) | low;
 
     // Convert to timespec (Assuming standard resolution of units per second)
@@ -389,8 +373,8 @@ bool PcapReceiver::stepPcapNg() noexcept {
         }
     }
 
-    uint32_t capLen  = m_swapped ? __builtin_bswap32(epb->capLen)  : epb->capLen;
-    uint32_t origLen = m_swapped ? __builtin_bswap32(epb->origLen) : epb->origLen;
+    uint32_t capLen  = maybeSwap(epb->capLen,  m_swapped);
+    uint32_t origLen = maybeSwap(epb->origLen, m_swapped);
 
     // Packet data starts after the EPB body
     const uint8_t* dataPtr = m_currentPtr + sizeof(PcapNgBlockHeader) + sizeof(PcapNgEPBBody);
@@ -407,12 +391,11 @@ void PcapReceiver::processBatch() {
     // Dispatch to optimized loop for the flood case
     if (m_pcapConfig.mode == ReplayMode::FLOOD) {
         processBatchFlood();
+        if (m_finished) return;
     }
 
     int totalProcessed = 0;
-    const int stopLimit = (m_pcapConfig.mode == ReplayMode::FLOOD)
-                          ? 10000
-                          : m_pcapConfig.batchSize;
+    const int stopLimit = m_pcapConfig.batchSize;
 
     while (totalProcessed < stopLimit) {
         // We prefetch ~128 bytes ahead of the current pointer.
@@ -477,8 +460,8 @@ std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
         return m_wallStartTs;
     }
 
-    long diff_sec = ts.tv_sec  - m_pcapStartTs.tv_sec;
-    long diff_ns  = ts.tv_nsec - m_pcapStartTs.tv_nsec;
+    int64_t diff_sec = static_cast<int64_t>(ts.tv_sec) - m_pcapStartTs.tv_sec;
+    int64_t diff_ns  = static_cast<int64_t>(ts.tv_nsec) - m_pcapStartTs.tv_nsec;
 
     // Normalize nanoseconds if negative (e.g., ts.tv_nsec < start.tv_nsec)
     if (diff_ns < 0) {
@@ -486,14 +469,14 @@ std::chrono::steady_clock::time_point PcapReceiver::calculateTargetTimeHighRes(
         diff_ns += 1000000000L;
     }
 
-    if (m_pcapConfig.speedMultiplier != 1.0) {
-        double total_ns = (double)diff_sec * 1e9 + (double)diff_ns;
-        total_ns /= m_pcapConfig.speedMultiplier;
-        diff_sec = (long)(total_ns / 1e9);
-        diff_ns = (long)((long long)total_ns % 1000000000L);
+    if (m_pcapConfig.speedMultiplier == 1.0) [[likely]] {
+        return m_wallStartTs + std::chrono::seconds(diff_sec) + std::chrono::nanoseconds(diff_ns);
     }
 
-    return m_wallStartTs + std::chrono::seconds(diff_sec) + std::chrono::nanoseconds(diff_ns);
+    double total_ns = (static_cast<double>(diff_sec) * 1e9 + static_cast<double>(diff_ns))
+                      / m_pcapConfig.speedMultiplier;
+
+    return m_wallStartTs + std::chrono::nanoseconds(static_cast<int64_t>(total_ns));
 }
 
 // This is portable AND fast because the compiler optimizes the array access
